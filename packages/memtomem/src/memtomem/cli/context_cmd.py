@@ -30,11 +30,15 @@ from memtomem.context.detector import (
 from memtomem.context.install import (
     AlreadyInstalledError,
     AssetNotFoundError,
+    CommitNotFoundError,
     NotInstalledError,
     ProjectClassification,
+    ProjectInstallClassification,
     StaleInstallError,
+    _apply_pinned_install,
     _apply_update,
     _classify_for_all_update,
+    _classify_for_install_all,
     install_agent,
     install_command,
     install_skill,
@@ -44,6 +48,7 @@ from memtomem.context.install import (
 )
 from memtomem.context.projects import KnownProjectsStore
 from memtomem.context.lockfile import LockfileVersionError
+from memtomem.context.status import classify_status, load_with_recovery
 from memtomem.context.generator import (
     GENERATORS,
     extract_sections_from_agent_file,
@@ -659,15 +664,56 @@ def sync_cmd(include: tuple[str, ...], strict: bool, on_drop: str, yes: bool) ->
 
 
 @context.command("install")
-@click.argument("asset_type", type=click.Choice(["skill", "agent", "command"]))
-@click.argument("name")
-def install_cmd(asset_type: str, name: str) -> None:
+@click.argument("asset_type", type=click.Choice(["skill", "agent", "command"]), required=False)
+@click.argument("name", required=False)
+@click.option(
+    "--all",
+    "all_assets",
+    is_flag=True,
+    help="Re-install every entry from <project>/.memtomem/lock.json at its pinned commit.",
+)
+@click.option(
+    "--yes",
+    is_flag=True,
+    help="Skip the confirmation prompt — intended for automation (cron / CI).",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help="Overwrite dirty dest; each dirty file is preserved as <file>.bak.",
+)
+def install_cmd(
+    asset_type: str | None,
+    name: str | None,
+    all_assets: bool,
+    yes: bool,
+    force: bool,
+) -> None:
     """Install a wiki asset into ``<project>/.memtomem/<type>/<name>/``.
 
-    The wiki at ``~/.memtomem-wiki/`` must be initialized first
-    (``mm wiki init``). Skills, agents, and commands all flow through
-    fan-out after install.
+    Without ``--all``: install a single ``<type> <name>`` from the wiki at
+    HEAD. The wiki at ``~/.memtomem-wiki/`` must be initialized first
+    (``mm wiki init``).
+
+    With ``--all``: walk ``<project>/.memtomem/lock.json`` and re-install
+    every entry **at the commit each entry pins** (NOT wiki HEAD). This
+    is the "fresh-machine restore" verb: a teammate ``git clone``s the
+    project, runs ``mm context install --all``, and reproduces the exact
+    asset bytes the lockfile recorded. To advance to wiki HEAD instead,
+    use ``mm context update --all``.
     """
+    if all_assets:
+        if asset_type or name:
+            raise click.UsageError("`--all` takes no <type> <name> arguments")
+        root = _find_project_root()
+        _run_install_all(root, yes=yes, force=force)
+        return
+
+    if not asset_type or not name:
+        raise click.UsageError("install requires <type> <name>, or pass --all")
+    if yes or force:
+        raise click.UsageError("--yes / --force only valid with --all")
+
     root = _find_project_root()
     try:
         if asset_type == "skill":
@@ -974,6 +1020,247 @@ def _print_classification_table(
     for c in classifications:
         color = state_color[c.state]
         line = f"  {c.state:10s}  {c.project_root}"
+        if c.reason:
+            line += f"  ({c.reason})"
+        click.secho(line, fg=color)
+
+
+_STATUS_GLYPH: dict[str, tuple[str, str]] = {
+    # state -> (glyph, click color)
+    "ok": ("✓", "green"),
+    "behind": ("↑", "cyan"),
+    "dirty": ("✗", "yellow"),
+    "missing": ("!", "red"),
+    "stale-pin": ("⚠", "red"),
+}
+
+
+@context.command("status")
+def status_cmd() -> None:
+    """Show installed wiki assets and their drift state.
+
+    Read-only. Walks ``<project>/.memtomem/lock.json`` and classifies
+    each entry against the dest tree and the wiki. Always exits 0 for
+    normal runs (cron-friendly chaining via ``mm context status && mm
+    context update --all``); only a corrupt / version-mismatched
+    lockfile produces a non-zero exit.
+    """
+    root = _find_project_root()
+
+    # Diagnostic lockfile read — surfaces a version mismatch as an
+    # error row at the top without crashing on the strict-mode path.
+    _doc, lockfile_error = load_with_recovery(root)
+
+    wiki = WikiStore.at_default()
+    wiki_head, rows = classify_status(root, wiki=wiki)
+
+    if lockfile_error is not None:
+        click.secho(f"  ✗ lock.json: {lockfile_error}", fg="red", err=True)
+
+    # Header — counts + wiki HEAD (or "wiki not present" annotation).
+    if wiki_head is None:
+        wiki_root = wiki.root
+        click.echo(
+            f".memtomem/ — {len(rows)} asset(s) installed — "
+            f"wiki not present at {wiki_root}; pin reachability not checked"
+        )
+    else:
+        click.echo(f".memtomem/ — {len(rows)} asset(s) installed — wiki HEAD {wiki_head[:12]}")
+
+    if not rows and lockfile_error is None:
+        click.echo("\nNo wiki assets installed in this project.")
+        return
+
+    # Sectioned by asset type, preserving iter_entries() order
+    # (alphabetical: agents → commands → skills, names alpha within).
+    last_type: str | None = None
+    summary: dict[str, int] = {"ok": 0, "behind": 0, "dirty": 0, "missing": 0, "stale-pin": 0}
+    for row in rows:
+        if row.asset_type != last_type:
+            click.secho(f"\n{row.asset_type}", fg="cyan")
+            last_type = row.asset_type
+        glyph, color = _STATUS_GLYPH[row.state]
+        installed_date = row.installed_at[:10] if row.installed_at else "—"
+        line = (
+            f"  {glyph}  {row.name:24s}  {(row.pin_commit or '?')[:12]}  installed {installed_date}"
+        )
+        if row.reason:
+            line += f"  ({row.reason})"
+        click.secho(line, fg=color)
+        summary[row.state] += 1
+
+    if rows:
+        parts = [
+            f"{summary[k]} {k}"
+            for k in ("ok", "behind", "dirty", "missing", "stale-pin")
+            if summary[k] > 0
+        ]
+        if parts:
+            click.echo("\nSummary: " + ", ".join(parts) + ".")
+
+    if lockfile_error is not None:
+        raise click.exceptions.Exit(1)
+
+
+# ── install --all (PR-D C3) ─────────────────────────────────────────────
+
+
+def _run_install_all(
+    root: Path,
+    *,
+    yes: bool,
+    force: bool,
+) -> None:
+    """Orchestrate ``mm context install --all`` (Option A: lockfile-pin restore).
+
+    Flow:
+
+    1. ``WikiStore.require_exists()`` — install --all needs the wiki repo
+       to read pinned commits via ``git show``. Without it, abort cleanly.
+    2. **No wiki dirty warning.** ``git show <pin>:<path>`` reads from
+       committed objects, so a dirty working tree in the wiki is
+       irrelevant — intentionally diverges from ``update --all`` which
+       does warn (it cares about HEAD).
+    3. Classify every entry in ``<project>/.memtomem/lock.json`` once
+       via ``_classify_for_install_all`` (cached lock_entry +
+       dirty_report passed through to execute).
+    4. Empty lockfile → "No entries..." stderr, exit 0.
+    5. Print 5-state preview table.
+    6. If only skip/orphan/error rows (no install/refuse) → exit 0.
+    7. ``refuse`` rows + no ``--force`` → red error + exit 1.
+    8. ``--yes --force`` → destructive WARNING.
+    9. Confirm prompt unless ``--yes``.
+    10. Serial execute loop with row-level icons.
+    11. Summary line.
+    """
+    try:
+        wiki = WikiStore.at_default()
+        wiki.require_exists()
+    except WikiNotFoundError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    try:
+        classifications = _classify_for_install_all(root, wiki=wiki)
+    except LockfileVersionError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if not classifications:
+        click.echo(
+            "No entries in lock.json — run `mm context install <type> <name>` first.",
+            err=True,
+        )
+        return
+
+    _print_install_classification_table(classifications)
+
+    needs_install = [c for c in classifications if c.state == "install"]
+    needs_force = [c for c in classifications if c.state == "refuse"]
+    has_skip_force = force and any(c.state == "skip" for c in classifications)
+    has_errors = [c for c in classifications if c.state == "error"]
+
+    # Refuse-blocks-batch: any dirty entry without --force aborts before any
+    # writes (mirrors update --all). Errors classified upfront still get
+    # surfaced via the table; we just refuse to continue.
+    if needs_force and not force:
+        click.secho(
+            f"\n{len(needs_force)} entry(ies) have local edits; "
+            f"pass --force to overwrite (each dirty file gets a .bak sibling). "
+            f"Refusing to write any entry — re-run with --force or resolve manually.",
+            fg="red",
+            err=True,
+        )
+        raise click.exceptions.Exit(1)
+
+    actionable = bool(needs_install) or bool(needs_force) or has_skip_force
+    if not actionable:
+        # Only skip / orphan / error rows; nothing to write.
+        click.echo("\nNothing to install.")
+        if has_errors:
+            raise click.exceptions.Exit(1)
+        return
+
+    if yes and force:
+        click.secho(
+            "WARNING: --yes --force is destructive — all dirty files will be "
+            "overwritten across the batch.",
+            fg="red",
+            err=True,
+        )
+
+    if not yes:
+        click.confirm("\nContinue?", abort=True)
+
+    successes = 0
+    skipped = 0
+    failures = 0
+    orphans = 0
+    for c in classifications:
+        if c.state == "orphan":
+            click.secho(f"  ⚠ {c.asset_type}/{c.name}: {c.reason}", fg="yellow")
+            orphans += 1
+            continue
+        if c.state == "error":
+            click.secho(f"  ✗ {c.asset_type}/{c.name}: {c.reason}", fg="red")
+            failures += 1
+            continue
+        if c.state == "skip" and not force:
+            click.secho(f"  - {c.asset_type}/{c.name}: already installed", fg="cyan")
+            skipped += 1
+            continue
+
+        # state ∈ {"install", "skip" with --force, "refuse"} — execute
+        try:
+            _apply_pinned_install(root, c, wiki=wiki, force=force)
+        except StaleInstallError as exc:
+            # state=refuse without --force shouldn't reach here; defense in depth.
+            click.secho(f"  ✗ {c.asset_type}/{c.name}: {exc}", fg="red")
+            failures += 1
+        except CommitNotFoundError as exc:
+            # Race: commit was reachable at classify time, gone now.
+            click.secho(f"  ⚠ {c.asset_type}/{c.name}: {exc}", fg="yellow")
+            orphans += 1
+        except AssetNotFoundError as exc:
+            click.secho(f"  ✗ {c.asset_type}/{c.name}: {exc}", fg="red")
+            failures += 1
+        except OSError as exc:
+            click.secho(f"  ✗ {c.asset_type}/{c.name}: {exc}", fg="red")
+            failures += 1
+        else:
+            click.secho(
+                f"  ✓ {c.asset_type}/{c.name}: installed at pin {c.pin_commit[:12]}", fg="green"
+            )
+            successes += 1
+
+    parts: list[str] = []
+    if successes:
+        parts.append(f"{successes} installed")
+    if skipped:
+        parts.append(f"{skipped} skipped")
+    if orphans:
+        parts.append(f"{orphans} orphaned")
+    if failures:
+        parts.append(f"{failures} failed")
+    click.echo("\nSummary: " + (", ".join(parts) if parts else "0 actions") + ".")
+
+    if failures:
+        raise click.exceptions.Exit(1)
+
+
+def _print_install_classification_table(
+    classifications: list[ProjectInstallClassification],
+) -> None:
+    """Render the 5-state preview table for ``install --all`` confirmation."""
+    click.echo(f"\nWill install across {len(classifications)} entry(ies):")
+    state_color = {
+        "install": "green",
+        "skip": "cyan",
+        "refuse": "yellow",
+        "orphan": "yellow",
+        "error": "red",
+    }
+    for c in classifications:
+        color = state_color[c.state]
+        line = f"  {c.state:8s}  {c.asset_type}/{c.name:20s}  {c.pin_commit[:12] or '?':12s}"
         if c.reason:
             line += f"  ({c.reason})"
         click.secho(line, fg=color)
