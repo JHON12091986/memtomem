@@ -1268,6 +1268,29 @@ function _renderStorageHealth(config, sources, embStatus) {
 }
 
 function _navigateToSource(path) {
+  // Resolve target vendor before switching so a Claude/OpenAI source
+  // clicked from Home recent or the command palette doesn't land on
+  // whichever vendor sub-tab the user last viewed — the
+  // ``.source-item[title=path]`` lookup below would silently miss
+  // because non-active vendors aren't rendered into the DOM. Same
+  // root cause as the navigateToSourcesByNs auto-switch in
+  // ``_renderMemorySourceTree``: a navigation entry-point sets one
+  // axis (path) without aligning the vendor sub-tab axis. Fall through
+  // when the source isn't in ``allSources`` yet (cold load) — current
+  // behaviour preserved, no regression.
+  const src = (STATE.allSources || []).find(s => s.path === path);
+  const status = src && src.memory_dir
+    ? (STATE.memoryStatusByPath || {})[src.memory_dir]
+    : null;
+  const provider = (status && typeof _SOURCES_VENDORS !== 'undefined'
+    && _SOURCES_VENDORS.includes(status.provider))
+    ? status.provider : null;
+  if (provider && STATE.sourcesActiveVendor !== provider) {
+    STATE.sourcesActiveVendor = provider;
+    if (typeof _syncSourcesVendorTabs === 'function') {
+      _syncSourcesVendorTabs(provider);
+    }
+  }
   activateTab('sources');
   setTimeout(() => {
     document.querySelectorAll('.source-item').forEach(el => {
@@ -2377,10 +2400,19 @@ function renderSourceTree(sources) {
   // The active-vendor scoping makes the number always match what the
   // user is currently looking at; global totals can be inferred by
   // summing the three sub-tab badges.
+  // Stats compute is deferred to ``_renderMemorySourceTree`` so it can
+  // observe the *post-auto-switch* active vendor. Reading
+  // ``STATE.sourcesActiveVendor`` here would race the NS-filter
+  // follow-through that shifts the sub-tab inside the tree pass \u2014 the
+  // stats line would then briefly show the pre-switch vendor's totals
+  // sitting above a post-switch tree (review feedback on PR #673).
+  _renderMemorySourceTree(sources, list);
+}
+
+function _renderSourcesStats(activeVendor) {
   const statsEl = qs('sources-stats');
+  if (!statsEl) return;
   const statusByPath = STATE.memoryStatusByPath || {};
-  const activeVendor = STATE.sourcesActiveVendor
-    || (typeof _readActiveSourcesVendor === 'function' ? _readActiveSourcesVendor() : 'user');
   let indexedFiles = 0;
   let totalChunks = 0;
   for (const s of Object.values(statusByPath)) {
@@ -2401,8 +2433,6 @@ function renderSourceTree(sources) {
   } else {
     statsEl.hidden = true;
   }
-
-  _renderMemorySourceTree(sources, list);
 }
 
 
@@ -2455,9 +2485,15 @@ function _renderMemorySourceTree(sources, list) {
     sourcesByDir[key].push(s);
   }
 
-  // Hide dirs whose files are all filtered out so a path filter
-  // doesn't leave empty "Claude (0)" rows behind.
-  const filterActive = !!(qs('sources-filter') && qs('sources-filter').value.trim());
+  // Hide dirs whose files are all filtered out so a path/namespace
+  // filter doesn't leave empty "Claude (0)" rows behind. The NS filter
+  // matters here because clicking a namespace card's Sources button
+  // routes through ``navigateToSourcesByNs`` — without this branch the
+  // tree keeps every dir header and only their file children disappear,
+  // which reads as "the link did nothing" when most dirs have zero
+  // matches.
+  const filterActive = !!(qs('sources-filter') && qs('sources-filter').value.trim())
+    || !!STATE.sourcesNsFilter;
 
   const PROVIDER_ORDER = (typeof _MEMORY_DIR_PROVIDER_ORDER !== 'undefined')
     ? _MEMORY_DIR_PROVIDER_ORDER : ['user', 'claude', 'openai'];
@@ -2594,6 +2630,44 @@ function _renderMemorySourceTree(sources, list) {
     STATE.sourcesActiveVendor = activeVendor;
     _syncSourcesVendorTabs(activeVendor);
   }
+
+  // NS-filter follow-through: a click on a namespace card's "Sources"
+  // button (settings-namespaces.js → navigateToSourcesByNs) sets
+  // ``sourcesNsFilter`` and switches to the Sources tab, but the
+  // active vendor stays at whatever the user last chose. For a
+  // ``claude:…`` or ``codex:…`` namespace this lands the user on the
+  // ``user`` tab where every dir is empty after filtering — chip says
+  // "ns: claude:…" but the visible tree is unrelated, which reads as
+  // "the link did nothing." When the current vendor has zero matches
+  // we shift to the vendor with the most. Not persisted via
+  // ``_writeActiveSourcesVendor`` — this is a navigation hint, not the
+  // user's stored preference.
+  if (STATE.sourcesNsFilter) {
+    const curPlan = vendorPlans[activeVendor];
+    if (!curPlan || curPlan.totalFiles === 0) {
+      // Tie-break leans on stable sort + ``PROVIDER_ORDER`` =
+      // ``['user', 'claude', 'openai']``: when two vendors hold the
+      // same number of NS matches, the earlier vendor in the order
+      // wins. Intentional — ``user`` is the conventional primary
+      // surface, so a tie shouldn't bury the user's own dirs behind
+      // a less-frequented vendor.
+      const best = PROVIDER_ORDER
+        .map(p => [p, vendorPlans[p] ? vendorPlans[p].totalFiles : 0])
+        .filter(([, n]) => n > 0)
+        .sort((a, b) => b[1] - a[1])[0];
+      if (best) {
+        activeVendor = best[0];
+        STATE.sourcesActiveVendor = activeVendor;
+        _syncSourcesVendorTabs(activeVendor);
+      }
+    }
+  }
+
+  // Stats line uses the *post-auto-switch* vendor so the "N files ·
+  // M chunks" caption above the tree always matches what's rendered
+  // below. Doing this in the caller (``renderSourceTree``) would race
+  // the NS-filter follow-through that mutates ``activeVendor`` here.
+  _renderSourcesStats(activeVendor);
 
   // Helpers shared by the active-vendor render branches. Lifted out of
   // the per-vendor loop because they don't close over the iteration.
