@@ -228,7 +228,7 @@ class TestNoHardcodedStrings:
             "toast.unexpected_response",
             "toast.sync_failed",
             "toast.create_failed",
-            "toast.detection_complete",
+            "toast.refresh_complete",
             "toast.name_required",
         }
         missing_en = required - set(en)
@@ -548,3 +548,206 @@ class TestNoHardcodedStrings:
         missing_ko = required_keys - set(ko)
         assert not missing_en, f"PR-2 tooltip/aria keys missing from en.json: {sorted(missing_en)}"
         assert not missing_ko, f"PR-2 tooltip/aria keys missing from ko.json: {sorted(missing_ko)}"
+
+    def test_q_pr1_required_keys_present(self, en: dict[str, str], ko: dict[str, str]) -> None:
+        """Q-PR1 introduced new keys for the Context Gateway dashboard:
+
+        * ``badge_empty`` — zero-state tile label (Bug-2).
+        * ``status_parse_error`` — runtime badge label (Drift-4).
+        * ``badge_error`` — own-namespace error label (Bug-3). Initially
+          piggy-backed on ``settings.hooks.badge_error``; PR #824
+          review pass-3 surfaced the cross-namespace coupling
+          (``settings.ctx.*`` reading the hooks panel's translation
+          values would silently drift if hooks ever relabels) and split
+          it into a dedicated ctx key.
+
+        And renamed the four ``detect``-named keys to ``refresh`` so the
+        i18n surface matches the (already-Refresh) button copy (Drift-2).
+        Pin them all."""
+        required = {
+            "settings.ctx.badge_empty",
+            "settings.ctx.badge_error",
+            "settings.ctx.status_parse_error",
+            "settings.ctx.refresh",
+            "settings.ctx.refresh_tooltip",
+            "settings.ctx.refresh_aria",
+            "toast.refresh_complete",
+        }
+        missing_en = required - set(en)
+        missing_ko = required - set(ko)
+        assert not missing_en, f"Q-PR1 keys missing from en.json: {sorted(missing_en)}"
+        assert not missing_ko, f"Q-PR1 keys missing from ko.json: {sorted(missing_ko)}"
+
+    def test_q_pr1_no_legacy_detect_keys(self, en: dict[str, str], ko: dict[str, str]) -> None:
+        """The ``detect`` naming was an alias for what the handler always
+        did — refresh the overview. Rename was a verbatim move (values
+        unchanged); the legacy keys must not linger or a future caller
+        could resurrect the inconsistency between button id, i18n, and
+        toast copy."""
+        legacy = {
+            "settings.ctx.detect",
+            "settings.ctx.detect_tooltip",
+            "settings.ctx.detect_aria",
+            "toast.detection_complete",
+        }
+        leftover_en = legacy & set(en)
+        leftover_ko = legacy & set(ko)
+        assert not leftover_en, f"Legacy detect keys still in en.json: {sorted(leftover_en)}"
+        assert not leftover_ko, f"Legacy detect keys still in ko.json: {sorted(leftover_ko)}"
+
+    def test_q_pr1_no_legacy_detect_in_ui_assets(self) -> None:
+        """index.html and context-gateway.js must reference the renamed
+        ``ctx-refresh-btn`` / ``settings.ctx.refresh*`` / ``toast.refresh_complete``
+        symbols, not the legacy ``detect`` aliases. A drift between
+        button id, i18n key, and toast key is exactly what Drift-2 was."""
+        forbidden_patterns = [
+            re.compile(r"\bctx-detect-btn\b"),
+            re.compile(r"toast\.detection_complete\b"),
+            re.compile(r"settings\.ctx\.detect(?:_tooltip|_aria)?\b(?!_)"),
+        ]
+        bad: list[str] = []
+        for name in ("index.html", "context-gateway.js"):
+            path = _STATIC_JS_DIR / name
+            if not path.exists():
+                continue
+            for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                for pat in forbidden_patterns:
+                    if pat.search(line):
+                        bad.append(f"  {name}:{lineno}: {line.strip()}")
+                        break
+        assert not bad, (
+            "Found legacy 'detect' references after Drift-2 rename — replace "
+            "with ctx-refresh-btn / settings.ctx.refresh* / toast.refresh_complete:\n"
+            + "\n".join(bad)
+        )
+
+    def test_q_pr1_overview_badge_routes_error_through_t(self) -> None:
+        """Bug-3 fix: the ``d.error`` branch in ``loadCtxOverview``'s badge
+        ladder used to assign a raw ``'Error'`` literal, leaking English
+        copy into Korean UIs. The branch must now route through
+        ``t('settings.ctx.badge_error')`` — own-namespace, after PR #824
+        review pass-3 split it from ``settings.hooks.badge_error`` so
+        the dashboard's translation surface doesn't reach across into
+        the hooks panel's keys (where a future hooks relabel would
+        silently drift the ctx text)."""
+        text = (_STATIC_JS_DIR / "context-gateway.js").read_text(encoding="utf-8")
+        m = re.search(
+            r"if \(d\.error\) \{\s*\n(?:\s*//[^\n]*\n)*\s*badgeText = ([^;]+);",
+            text,
+        )
+        assert m, "Could not locate the d.error branch in context-gateway.js loadCtxOverview"
+        rhs = m.group(1).strip()
+        assert "settings.ctx.badge_error" in rhs, (
+            f"d.error branch must route through t('settings.ctx.badge_error'); got: {rhs!r}"
+        )
+        # Symmetric negative: the legacy hooks reach-across must not
+        # creep back in. Distinct keys with similar values invite a
+        # silent regression where a refactor "simplifies" two
+        # almost-identical strings into one cross-namespace call.
+        assert "settings.hooks.badge_error" not in rhs, (
+            f"d.error branch must not cross into settings.hooks.* — "
+            f"the dashboard owns its own badge_error key; got: {rhs!r}"
+        )
+
+    def test_q_pr1_overview_has_sequence_guard(self) -> None:
+        """Bug-1 multi-toggle race guard: ``loadCtxOverview`` must read +
+        check a module-level sequence counter so a slow fetch from an
+        earlier toggle cannot clobber the cards rendered by a later
+        toggle. The browser test in ``test_context_gateway_overview.py``
+        pins the multi-toggle *outcome* but cannot deterministically
+        reproduce the race window (Playwright sync route handlers serialize
+        on the dispatcher thread, so a delay on one fetch also delays the
+        next). The guard itself — counter + capture + bail-on-stale — is
+        what this static check enforces."""
+        text = (_STATIC_JS_DIR / "context-gateway.js").read_text(encoding="utf-8")
+        assert "_ctxOverviewSeq" in text, (
+            "missing _ctxOverviewSeq module counter — Bug-1 race guard"
+        )
+        assert re.search(r"const seq\s*=\s*\+\+_ctxOverviewSeq", text), (
+            "loadCtxOverview must capture-and-bump _ctxOverviewSeq at entry"
+        )
+        # Both the success path (after innerHTML compute) and the catch
+        # path must early-return when the captured seq is stale; without
+        # the catch-path guard a late error overlay would clobber the
+        # cards rendered by a newer toggle.
+        guards = re.findall(r"if \(seq !==\s*_ctxOverviewSeq\)\s*return;", text)
+        assert len(guards) >= 2, (
+            f"expected sequence-guard returns in both success+catch paths, found {len(guards)}"
+        )
+
+    def test_q_pr1_langchange_listener_reloads_overview(self) -> None:
+        """Bug-1 single-toggle pin: the ``langchange`` listener in
+        context-gateway.js must call ``loadCtxOverview`` when the
+        overview section is the active settings pane — and only then.
+
+        ``#settings-ctx-overview`` always exists in the DOM regardless of
+        which page the user is on; gating on mere element existence
+        (``qs('ctx-overview-content')`` truthiness) would fire a fetch on
+        every language toggle from any page, not just the dashboard.
+        The active-class gate matches ``switchSettingsSection``'s own
+        ``section.classList.add('active')`` contract (app.js:1191).
+        """
+        text = (_STATIC_JS_DIR / "context-gateway.js").read_text(encoding="utf-8")
+        m = re.search(
+            r"window\.addEventListener\('langchange',\s*\(\)\s*=>\s*\{(.+?)\}\);",
+            text,
+            re.DOTALL,
+        )
+        assert m, "langchange listener missing from context-gateway.js"
+        body = m.group(1)
+        assert "loadCtxOverview()" in body, (
+            "langchange listener must call loadCtxOverview() for the inline-templated cards"
+        )
+        # Two-gate active check: both the main Settings tab
+        # (``#tab-settings``) AND the Context Gateway settings sub-section
+        # (``#settings-ctx-overview``) must carry ``.active`` before
+        # reloading.
+        #   * Section gate alone is insufficient: ``activateTab`` toggles
+        #     panel-level ``.active`` + ``hidden`` but does not reach into
+        #     sub-section classes, so leaving Settings for Search keeps
+        #     the section's ``.active`` set and a toggle from Search
+        #     would still hit /api/context/overview (PR #824 review P2).
+        #   * Tab gate alone is insufficient: a user could be in Settings
+        #     but viewing Hooks, where reloading the unmounted overview
+        #     dashboard is wasted work.
+        assert "tab-settings" in body, (
+            "langchange listener must reference #tab-settings — "
+            "without the main-tab gate, off-Settings toggles still fetch"
+        )
+        assert "settings-ctx-overview" in body, (
+            "langchange listener must reference #settings-ctx-overview "
+            "to gate the reload to the active pane"
+        )
+        # Counts: at least two ``classList.contains('active')`` calls (one
+        # per gate). Quoting style matches the source — both single-quote
+        # and double-quote forms accepted in case ruff reformats one day.
+        active_calls = body.count("classList.contains('active')") + body.count(
+            'classList.contains("active")'
+        )
+        assert active_calls >= 2, (
+            f"langchange listener must check classList.contains('active') "
+            f"on both #tab-settings and #settings-ctx-overview; found "
+            f"{active_calls} call(s)"
+        )
+
+    def test_q_pr1_status_parse_error_mapped(self) -> None:
+        """Drift-4: ``_ctxStatusLabel`` in context-gateway.js must map the
+        ``'parse error'`` wire status to ``settings.ctx.status_parse_error``.
+        Without this row ``_ctxStatusText`` falls back to the raw English
+        wire string, defeating the whole status-label i18n surface for
+        the runtime badges. The same module also defines ``_ctxStatusCls``
+        which separately keys ``'parse error'`` (to a CSS class) — extract
+        the label block first so the assertion targets the i18n map only."""
+        text = (_STATIC_JS_DIR / "context-gateway.js").read_text(encoding="utf-8")
+        block_match = re.search(
+            r"const _ctxStatusLabel\s*=\s*\{(.+?)\};",
+            text,
+            re.DOTALL,
+        )
+        assert block_match, "Could not locate _ctxStatusLabel block in context-gateway.js"
+        block = block_match.group(1)
+        m = re.search(r"'parse error':\s*'([^']+)'", block)
+        assert m, "Missing 'parse error' key in _ctxStatusLabel — Drift-4 regression"
+        assert m.group(1) == "settings.ctx.status_parse_error", (
+            f"'parse error' must map to settings.ctx.status_parse_error; got: {m.group(1)!r}"
+        )
