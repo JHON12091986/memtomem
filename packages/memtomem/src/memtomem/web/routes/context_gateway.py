@@ -140,14 +140,47 @@ async def context_overview(
     try:
         settings_diff = diff_settings(project_root)
         statuses = [r.status for r in settings_diff.values()]
+        # `total` counts only **applicable** generators (runtime installed +
+        # canonical source present). `skipped` items are N/A — including them
+        # would make the dashboard read "1/2 synced" even when the second slot
+        # is "no Codex installed", which misleads the user about actionable work.
+        total_applicable = sum(1 for s in statuses if s != "skipped")
+        # diff_settings emits 5 status values (settings.py:386-404):
+        # `in sync`, `out of sync`, `missing target`, `error`, `skipped`.
+        # All four non-skipped categories must be represented as count
+        # fields so `in_sync + out_of_sync + missing_target + error ==
+        # total_applicable` holds — that contract lets future consumers
+        # render per-status segments without the count silently dropping
+        # entries on the floor. `missing target` is the common first-use
+        # state (existing is None — settings.py:403-404), parallel to
+        # how skills/commands/agents already emit `missing_target`.
+        in_sync = sum(1 for s in statuses if s == "in sync")
+        out_of_sync = sum(1 for s in statuses if s == "out of sync")
+        missing_target = sum(1 for s in statuses if s == "missing target")
+        error_count = sum(1 for s in statuses if s == "error")
         if all(s in ("in sync", "skipped") for s in statuses):
-            result["settings"] = {"status": "in_sync"}
+            status = "in_sync"
         elif any(s == "error" for s in statuses):
             # In-band error: per-file failure already classified by diff_settings.
             # No error_kind here — adding one would conflate distinct per-file causes.
-            result["settings"] = {"status": "error"}
+            status = "error"
         else:
-            result["settings"] = {"status": "out_of_sync"}
+            status = "out_of_sync"
+        # `error` is a count here (parallel to `out_of_sync` / `in_sync` /
+        # `missing_target`), NOT the bool flag `_error_payload(shape="total")`
+        # emits when the whole call raises. The two shapes are on disjoint
+        # code paths. The frontend uses truthiness on `d.error` (any
+        # positive int OR the bool `true` reaches the danger render at
+        # context-gateway.js:136-145), so `error: 0` correctly skips the
+        # danger branch and `error: >=1` reaches it — both shapes work.
+        result["settings"] = {
+            "total": total_applicable,
+            "in_sync": in_sync,
+            "out_of_sync": out_of_sync,
+            "missing_target": missing_target,
+            "error": error_count,
+            "status": status,
+        }
     except Exception as exc:
         logger.exception("diff_settings failed")
         result["settings"] = _error_payload(exc, shape="status")
