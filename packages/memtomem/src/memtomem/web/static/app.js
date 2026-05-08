@@ -891,9 +891,11 @@ function panelLoading(container) {
 }
 
 // ── A5: Empty State ──
+// Owns its `.empty-state` wrapper — callers must NOT add their own.
 function emptyState(icon, message, hint) {
+  const i = icon ? `<span class="empty-state-icon">${icon}</span>` : '';
   const h = hint ? `<span class="empty-state-hint">${escapeHtml(hint)}</span>` : '';
-  return `<span class="empty-state-icon">${icon}</span><span>${escapeHtml(message)}</span>${h}`;
+  return `<div class="empty-state">${i}<span>${escapeHtml(message)}</span>${h}</div>`;
 }
 
 // ── A1: Toast Notifications ──
