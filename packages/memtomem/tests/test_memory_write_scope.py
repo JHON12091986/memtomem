@@ -860,6 +860,90 @@ async def test_mem_consolidate_apply_mixed_project_roots_refuses(
     assert str(proj_b) in out
 
 
+@pytest.mark.asyncio
+async def test_mem_consolidate_apply_null_project_root_project_tier_refuses(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """ADR-0011 PR-D review round 10 (B1) pin: refuse a project-tier
+    consolidate group when EVERY source chunk has ``project_root=None``.
+
+    Pre-fix shape: ``source_project_roots`` is empty (set comprehension
+    skips ``None`` values), the ``len > 1`` mixed-project guard does
+    NOT fire, and ``project_root_override = next(iter({}), None) =
+    None``. ``_mem_add_core`` then resolves the write target via
+    ``_resolve_project_context_root(app)`` (server cwd), so a
+    project_shared summary lands in whatever project the server cwd
+    happens to cover — silent cross-project leak for legacy rows
+    that pre-date the PR-B project_root backfill.
+
+    Post-fix: explicit refusal naming the missing project_root.
+    """
+    from memtomem.server.tools import consolidation
+
+    comp, mem_dir = bm25_only_components
+    # Server cwd happens to cover this project — so a leak would land
+    # the summary HERE if the guard fired. The refusal must beat the
+    # cwd fallback to the punch.
+    server_proj = tmp_path / "server_cwd_proj"
+    server_proj_dir = server_proj / ".memtomem" / "memories"
+    server_proj_dir.mkdir(parents=True)
+    comp.config.indexing.project_memory_dirs = [server_proj_dir]
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: server_proj,
+    )
+
+    # Two project_shared chunks — but with project_root=None on the
+    # metadata. Models.py default is ``project_root=None`` so this
+    # exact shape can result from any decode path that doesn't set
+    # the column (legacy rows pre-migration backfill).
+    user_md = mem_dir / "legacy.md"
+    user_md.write_text("## hi\n\nlegacy content\n")
+    chunks = [
+        Chunk(
+            content="legacy one",
+            metadata=ChunkMetadata(
+                source_file=user_md,
+                scope="project_shared",
+                project_root=None,  # the bug shape
+                start_line=1,
+                end_line=2,
+            ),
+            embedding=[0.1] * 1024,
+        ),
+        Chunk(
+            content="legacy two",
+            metadata=ChunkMetadata(
+                source_file=user_md,
+                scope="project_shared",
+                project_root=None,
+                start_line=3,
+                end_line=4,
+            ),
+            embedding=[0.1] * 1024,
+        ),
+    ]
+    await _stage_consolidate_group(comp, chunks, group_id=0)
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await consolidation.mem_consolidate_apply(
+        group_id=0,
+        summary="combined",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "skipped group 0" in out
+    assert "no source chunk carries a persisted project_root" in out
+    # Negative pin — message must NOT mention the server-cwd project,
+    # because the leak shape would have surfaced it.
+    assert str(server_proj) not in out
+    # No file landed in server_cwd_proj's tier (no leak).
+    assert not list(server_proj_dir.glob("*.md")), (
+        "summary must NOT have leaked into server-cwd project on NULL project_root"
+    )
+
+
 def test_validate_path_accepts_project_memory_dirs(tmp_path):
     """``_validate_path`` rejects absolute paths outside both base lists,
     accepts paths under either ``memory_dirs`` or ``project_memory_dirs``.

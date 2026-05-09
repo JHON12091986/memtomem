@@ -761,6 +761,22 @@ class IndexEngine:
         # ``("user", None)`` for files outside any registered project
         # tier; scope-aware behavior lands in PR-C / PR-D once the read
         # / write surfaces are spec'd.
+        #
+        # PR-D round 10 (M1) note: hash-diff means unchanged chunks
+        # aren't re-UPSERTed on a regular reindex, so a previously
+        # project_shared file whose project tier is later deregistered
+        # keeps its stale ``scope='project_shared'`` / ``project_root``
+        # rows in storage. The in-project default merge then surfaces
+        # them whenever the user is back in the deregistered cwd.
+        # ``mm reindex --force`` is the documented escape hatch:
+        # ``force=True`` promotes every unchanged chunk into
+        # ``to_upsert`` (line 789 below) and the subsequent UPSERT
+        # overwrites the persisted scope with the freshly-resolved
+        # value (defaults match ``ChunkMetadata.scope='user',
+        # project_root=None``, so the ("user", None) skip below is
+        # safe — the new chunks already carry the correct defaults).
+        # The CHANGELOG ADR-0011 PR-B entry documents the
+        # post-deregistration reindex requirement.
         scope_val, project_root = self._resolve_scope(file_path)
         if scope_val != "user" or project_root is not None:
             new_chunks = self._apply_scope(new_chunks, scope_val, project_root)

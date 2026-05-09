@@ -691,19 +691,42 @@ class SqliteBackend(
         new_scope: str,
         new_project_root: Path | None,
     ) -> int:
-        """Move indexed chunks to a new source path and scope without changing IDs."""
+        """Move indexed chunks to a new source path and scope without changing IDs.
+
+        ADR-0011 PR-D round 10 (B2 partial fix): the SELECT-then-UPDATE
+        pair is wrapped in an explicit ``BEGIN IMMEDIATE`` so a
+        concurrent writer (e.g. the indexer watcher firing
+        ``index_file(new_path)`` between our two statements) cannot
+        sneak in INSERTs for ``new_path`` and end up with duplicate
+        chunks at the destination. ``BEGIN IMMEDIATE`` acquires a
+        ``RESERVED`` lock up front, blocking other writers but not
+        readers — Python's default lazy transaction start would only
+        promote on the first DML, leaving the SELECT phase exposed.
+        """
         db = self._get_db()
         old_norm = norm_path(old_path)
         new_norm = norm_path(new_path)
         project_root = str(new_project_root) if new_project_root else None
-        rows = db.execute(
-            "SELECT rowid FROM chunks WHERE source_file=?",
-            (old_norm,),
-        ).fetchall()
-        if not rows:
-            return 0
-        rowids = [row[0] for row in rows]
+        # Take an explicit RESERVED lock before the SELECT so the
+        # rowid set we read can't be invalidated by a concurrent
+        # watcher INSERT before we UPDATE. ``BEGIN IMMEDIATE`` is a
+        # no-op if we're already inside an outer ``transaction()``
+        # context (sqlite raises which we swallow); guard via the
+        # backend's own ``_in_transaction`` flag.
+        opened_tx = False
+        if not self._in_transaction:
+            db.execute("BEGIN IMMEDIATE")
+            opened_tx = True
         try:
+            rows = db.execute(
+                "SELECT rowid FROM chunks WHERE source_file=?",
+                (old_norm,),
+            ).fetchall()
+            if not rows:
+                if opened_tx:
+                    db.commit()
+                return 0
+            rowids = [row[0] for row in rows]
             db.execute(
                 "UPDATE chunks SET source_file=?, scope=?, project_root=?, "
                 "updated_at=CURRENT_TIMESTAMP WHERE source_file=?",
@@ -713,10 +736,10 @@ class SqliteBackend(
                 f"UPDATE chunks_fts SET source_file=? WHERE rowid IN ({placeholders(len(rowids))})",
                 [new_norm, *rowids],
             )
-            if not self._in_transaction:
+            if opened_tx:
                 db.commit()
         except Exception as exc:
-            if not self._in_transaction:
+            if opened_tx:
                 db.rollback()
             raise StorageError(
                 f"update_chunks_scope_for_source failed, transaction rolled back: {exc}"

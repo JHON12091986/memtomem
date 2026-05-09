@@ -254,6 +254,34 @@ async def mem_consolidate_apply(
             "re-run mem_consolidate with a source_filter that pins a single "
             "project."
         )
+    # ADR-0011 PR-D review round 10 (B1): a project-tier ``derived_scope``
+    # with EVERY source chunk carrying ``project_root=None`` (legacy rows
+    # written before the PR-B migration backfill, or any decode that
+    # leaves the column NULL) used to fall through ``project_root_override =
+    # None`` → ``_mem_add_core`` then resolved the target via
+    # ``_resolve_project_context_root(app)`` (server cwd) and the summary
+    # silently leaked into whatever project the server happened to be in.
+    # The mixed-project rejection above only fires for ``> 1`` distinct
+    # roots; the zero-root case slipped past. Refuse explicitly so the
+    # write target cannot be inferred from ambient context.
+    if derived_scope in ("project_shared", "project_local") and not source_project_roots:
+        logger.warning(
+            "mem_consolidate_apply: skipping group %s — derived_scope=%s but no source "
+            "chunk carries project_root",
+            group_id,
+            derived_scope,
+        )
+        return (
+            f"Error: skipped group {group_id}: derived_scope='{derived_scope}' "
+            "but no source chunk carries a persisted project_root. The "
+            "summary's destination cannot be resolved without falling "
+            "back to the MCP server's current cwd, which would risk a "
+            "cross-project leak. This typically affects pre-ADR-0011 rows "
+            "that were not project-classified by the schema migration; "
+            "re-index the source files (mm reindex) so chunks carry "
+            "project_root, or re-run mem_consolidate with a source_filter "
+            "that pins a single registered project."
+        )
     project_root_override: "Path | None" = (
         next(iter(source_project_roots)) if source_project_roots else None
     )

@@ -140,6 +140,40 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **ADR-0011 PR-D review round 10 — `mem_consolidate_apply` rejects
+  project-tier groups with no source `project_root`.** Round 7 added
+  the cross-project leak guard for groups whose sources span >1
+  distinct ``project_root``, but the zero-root case slipped past:
+  every source chunk with ``project_root=None`` (legacy rows
+  pre-PR-B backfill, or any decode that left the column NULL) made
+  ``project_root_override=None`` and ``_mem_add_core`` then resolved
+  the destination via the server cwd, silently leaking summaries
+  into whatever project the server happened to be in. Now rejects
+  with an explicit ``no source chunk carries a persisted project_root``
+  message naming a ``mm reindex`` recovery path.
+- **ADR-0011 PR-D review round 10 — `mm context memory-migrate`
+  watcher race + transaction lock-up.** The migrate command now
+  holds a sidecar advisory lock on both the source and target paths
+  spanning ``shutil.move`` + ``update_chunks_scope_for_source`` (the
+  ``feedback_sidecar_lockfile_for_replaced_files.md`` pattern), and
+  ``update_chunks_scope_for_source`` wraps its SELECT-then-UPDATE
+  pair in an explicit ``BEGIN IMMEDIATE`` transaction. Without
+  these, a concurrent ``mm web`` watcher firing
+  ``index_file(target)`` between the FS move and the DB UPDATE could
+  INSERT duplicate chunk rows at the destination, defeating the
+  chunk-id-stability guarantee the migrate command promises.
+- **ADR-0011 PR-D review round 10 — `mm context memory-migrate
+  --yes` parity.** ``--to project_shared`` now requires an explicit
+  ``--confirm-project-shared``; ``--yes`` alone is no longer
+  sufficient. Mirrors the round-7 fix on ``mm mem add`` for CLI/MCP
+  parity with the MCP ``confirm_project_shared=True`` requirement.
+- **ADR-0011 PR-D review round 10 — engine `_apply_scope` unchanged-
+  chunk drift documented.** Hash-diff means unchanged chunks are not
+  re-UPSERTed on a regular reindex, so a previously project-tier
+  file whose project is later deregistered keeps stale ``scope`` /
+  ``project_root`` rows in storage. Documented the
+  ``mm reindex --force`` recovery path inline at the engine site
+  and via the existing CHANGELOG project-tier migration entry.
 - **ADR-0011 PR-D review round 9 — read surfaces thread project
   context onto the always-on scope filter.** Round 7 introduced the
   always-on scope-context fragment in

@@ -2057,6 +2057,7 @@ async def _memory_migrate_run(
 
     from memtomem import privacy
     from memtomem.cli._bootstrap import cli_components
+    from memtomem.context._atomic import _file_lock, _lock_path_for
     from memtomem.memory_scope import (
         MemoryScopeError,
         is_project_tier_registered,
@@ -2159,7 +2160,22 @@ async def _memory_migrate_run(
             click.echo("\nRun with --apply to execute.")
             return
 
-        if to_scope == "project_shared" and not (yes or confirm_project_shared):
+        # ADR-0011 PR-D review round 10 (M2): require an explicit
+        # ``--confirm-project-shared`` for project_shared targets,
+        # mirroring the round-7 fix on ``mm mem add``. ``--yes`` is a
+        # generic "skip prompts" flag users alias for unrelated reasons;
+        # accepting it as Gate B satisfaction would let
+        # ``mm context memory-migrate --to project_shared --yes``
+        # silently rewrite git-tracked memory without an explicit
+        # project-shared opt-in. Interactive prompt path remains for
+        # the no-flag case.
+        if to_scope == "project_shared" and not confirm_project_shared:
+            if yes:
+                raise click.ClickException(
+                    "--to project_shared requires --confirm-project-shared. "
+                    "--yes alone is not sufficient: project_shared writes go to "
+                    "the git-tracked memory tier and require explicit opt-in."
+                )
             if not click.confirm(
                 f"\nThis will write to the git-tracked tier {to_dir}. Continue?",
                 default=False,
@@ -2167,32 +2183,54 @@ async def _memory_migrate_run(
                 raise click.Abort()
 
         target.parent.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(source), str(target))
-        try:
-            updated = await comp.storage.update_chunks_scope_for_source(
-                source,
-                target,
-                to_scope,
-                project_root if to_scope != "user" else None,
-            )
-        except Exception as exc:
-            # Compensation: SQLite TX cannot roll back the FS move on
-            # its own. Revert the move (best-effort) so the source
-            # path remains canonical and the next attempt sees the
-            # pre-migration state.
+        # ADR-0011 PR-D review round 10 (B2): hold an exclusive sidecar
+        # lock on BOTH source and target paths spanning the FS move and
+        # the DB UPDATE. A concurrent ``mm web`` watcher fires
+        # ``index_file(target)`` on the move event; without the lock the
+        # watcher can race in between ``shutil.move`` and
+        # ``update_chunks_scope_for_source`` and INSERT a fresh chunk
+        # row at ``target`` (new UUID) before our UPDATE flips the
+        # original chunk's source_file. End state: two sets of chunks
+        # at the destination, defeating the chunk-id-stability guarantee
+        # the migrate command promises. Lock the source first so the
+        # post-move target lock is taken before any watcher can observe
+        # the rename. Locks live on the file's parent so they survive
+        # the rename (lockfile inodes are stable; ``feedback_sidecar_
+        # lockfile_for_replaced_files.md``).
+        with _file_lock(_lock_path_for(source)), _file_lock(_lock_path_for(target)):
+            shutil.move(str(source), str(target))
             try:
-                shutil.move(str(target), str(source))
-            except Exception:
-                click.secho(
-                    "  ✗ DB update failed AND filesystem rollback failed; "
-                    "source/target may diverge. Inspect both paths.",
-                    fg="red",
-                    err=True,
+                updated = await comp.storage.update_chunks_scope_for_source(
+                    source,
+                    target,
+                    to_scope,
+                    project_root if to_scope != "user" else None,
                 )
-                raise
-            raise click.ClickException(
-                f"DB update failed; filesystem move reverted: {exc}"
-            ) from exc
+            except Exception as exc:
+                # Compensation: SQLite TX cannot roll back the FS move
+                # on its own. Revert the move (best-effort) so the
+                # source path remains canonical and the next attempt
+                # sees the pre-migration state.
+                #
+                # ``shutil.move`` falls back to copy + unlink on
+                # cross-device renames; if the unlink fails we end up
+                # with both source and target present. The compensation
+                # block reaches here only when ``shutil.move(target →
+                # source)`` raises, which is rare in practice but worth
+                # the explicit message.
+                try:
+                    shutil.move(str(target), str(source))
+                except Exception:
+                    click.secho(
+                        "  ✗ DB update failed AND filesystem rollback failed; "
+                        "source/target may diverge. Inspect both paths.",
+                        fg="red",
+                        err=True,
+                    )
+                    raise
+                raise click.ClickException(
+                    f"DB update failed; filesystem move reverted: {exc}"
+                ) from exc
 
         comp.search_pipeline.invalidate_cache()
         click.secho(

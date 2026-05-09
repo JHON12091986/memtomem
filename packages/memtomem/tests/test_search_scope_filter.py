@@ -453,6 +453,46 @@ async def test_dense_search_adaptive_overfetch_recovers_from_cross_project_skew(
 
 
 @pytest.mark.asyncio
+async def test_bm25_search_hostile_scope_string_does_not_break_sql(storage, tmp_path):
+    """ADR-0011 PR-D review round 10 minor pin: a hostile ``--scope``
+    value is parameterized cleanly by ``scope_context_sql`` — it never
+    reaches the SQL surface as a literal substring, so the canonical
+    SQL-injection shape (``user'; DROP TABLE chunks;--``) goes through
+    as a regular IN-clause parameter with zero matches.
+
+    We don't assert strictly on the result set; the load-bearing pin is
+    that the call returns cleanly (no ``OperationalError`` from a
+    syntax-broken WHERE) AND that ``chunks`` still exists post-call
+    (the table was not dropped). Empty result is the natural outcome
+    because no real chunk has that exact scope string.
+    """
+    proj = tmp_path / "p"
+    proj.mkdir()
+    benign = _make_chunk_at_scope(
+        content="benign content",
+        source_file=tmp_path / "u.md",
+        scope="user",
+        project_root=None,
+    )
+    await storage.upsert_chunks([benign])
+
+    hostile = ScopeFilter.parse("user'; DROP TABLE chunks;--")
+    # Should not raise; should return zero results because no row has
+    # that exact scope string.
+    results = await storage.bm25_search("benign", top_k=5, scope_filter=hostile)
+    assert results == []
+
+    # Critical post-condition: ``chunks`` table is still present and
+    # the benign row still exists. If the hostile value had ever been
+    # interpolated into the SQL text, the trailing ``DROP TABLE`` would
+    # have committed and the next query would raise.
+    rows = await storage.recall_chunks(limit=10)
+    assert any(r.content == "benign content" for r in rows), (
+        "chunks table appears to have been dropped — SQL-injection probe failed"
+    )
+
+
+@pytest.mark.asyncio
 async def test_bm25_search_filters_inside_candidate_selection(storage, tmp_path):
     """PR-D review #2 pin: scope/namespace filter must run inside the
     FTS candidate selection, not after a post-LIMIT join.

@@ -161,13 +161,16 @@ async def test_memory_migrate_apply_user_to_project_shared_chunk_ids_preserved(
     _patch_cli_components(monkeypatch, comp)
     monkeypatch.chdir(project_root)
 
+    # ADR-0011 PR-D round 10 (M2): ``--to project_shared`` requires an
+    # explicit ``--confirm-project-shared``; ``--yes`` alone is no
+    # longer sufficient (mirrors the round-7 ``mm mem add`` parity fix).
     await _memory_migrate_run(
         src.resolve(),
         from_scope="user",
         to_scope="project_shared",
         apply_=True,
         yes=True,
-        confirm_project_shared=False,
+        confirm_project_shared=True,
     )
 
     # Source no longer exists; target lives in project tier.
@@ -223,6 +226,117 @@ def test_memory_migrate_apply_project_shared_target_blocks_on_secret(
     out = result.output + str(result.exception or "")
     assert "Gate A" in out
     assert "git history is forever" in out
+    # Source untouched on rejection.
+    assert src.exists()
+    comp.storage.update_chunks_scope_for_source.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_memory_migrate_update_uses_begin_immediate_transaction(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """ADR-0011 PR-D review round 10 (B2) pin: the SELECT-then-UPDATE
+    inside ``update_chunks_scope_for_source`` runs under an explicit
+    ``BEGIN IMMEDIATE`` so a concurrent watcher INSERT cannot sneak in
+    between the rowid lookup and the UPDATE — otherwise duplicate
+    chunks land at the destination, defeating chunk-id stability.
+
+    Uses a SQL-trace spy on ``db.execute`` to confirm the transaction
+    boundary is opened explicitly. Pre-fix relied on Python sqlite3's
+    lazy-DML transaction promotion which left the SELECT phase
+    exposed (sqlite_backend.py round-10 docstring).
+    """
+    comp, mem_dir = bm25_only_components
+
+    src = mem_dir / "rule.md"
+    src.write_text("## Rule\n\nbody.\n", encoding="utf-8")
+    target = tmp_path / "moved" / "rule.md"
+    target.parent.mkdir(parents=True)
+
+    chunk = Chunk(
+        content="body.",
+        metadata=ChunkMetadata(
+            source_file=src,
+            scope="user",
+            project_root=None,
+            start_line=1,
+            end_line=2,
+        ),
+        embedding=[0.1] * 1024,
+    )
+    await comp.storage.upsert_chunks([chunk])
+
+    # ``sqlite3.Connection.execute`` is a C-level slot, can't be
+    # monkeypatched directly. Use ``set_trace_callback`` — sqlite3's
+    # canonical hook for SQL tracing (fires on every prepared statement
+    # before execution).
+    db = comp.storage._get_db()
+    sql_trace: list[str] = []
+    db.set_trace_callback(lambda sql: sql_trace.append(sql.strip().split("\n", 1)[0]))
+
+    try:
+        await comp.storage.update_chunks_scope_for_source(
+            src,
+            target,
+            "user",
+            None,
+        )
+    finally:
+        db.set_trace_callback(None)
+
+    # The transaction boundary fires before the SELECT.
+    assert any("BEGIN IMMEDIATE" in s.upper() for s in sql_trace), (
+        f"update_chunks_scope_for_source must wrap SELECT+UPDATE in "
+        f"BEGIN IMMEDIATE, observed SQL trace: {sql_trace}"
+    )
+    # And the BEGIN IMMEDIATE precedes the SELECT (lock acquired up-front).
+    begin_idx = next(i for i, s in enumerate(sql_trace) if "BEGIN IMMEDIATE" in s.upper())
+    select_idx = next(i for i, s in enumerate(sql_trace) if "SELECT rowid FROM chunks" in s)
+    assert begin_idx < select_idx, (
+        "BEGIN IMMEDIATE must fire BEFORE the SELECT phase, otherwise the "
+        "RESERVED lock is acquired only after the rowid set is read and a "
+        "concurrent writer can race in. Trace: " + str(sql_trace)
+    )
+
+
+def test_memory_migrate_yes_alone_rejects_project_shared(monkeypatch, fake_project_layout):
+    """ADR-0011 PR-D review round 10 (M2) pin: ``--yes`` alone must
+    NOT satisfy Gate B for ``--to project_shared``. Mirrors the
+    round-7 fix on ``mm mem add`` (cli/memory.py:202-217).
+    """
+    from memtomem.cli.context_cmd import memory_migrate_cmd
+
+    layout = fake_project_layout
+    src = layout["src"]
+
+    comp = AsyncMock()
+    comp.config.indexing.memory_dirs = [layout["user_tier"]]
+    comp.config.indexing.project_memory_dirs = [layout["proj_shared"]]
+    comp.storage = AsyncMock()
+    comp.storage.count_chunks_by_source = AsyncMock(return_value=1)
+    comp.storage.update_chunks_scope_for_source = AsyncMock()
+    comp.search_pipeline = AsyncMock()
+    _patch_cli_components(monkeypatch, comp)
+    monkeypatch.chdir(layout["project_root"])
+
+    runner = CliRunner()
+    result = runner.invoke(
+        memory_migrate_cmd,
+        [
+            str(src),
+            "--from",
+            "user",
+            "--to",
+            "project_shared",
+            "--apply",
+            "--yes",
+            # NO --confirm-project-shared
+        ],
+    )
+    assert result.exit_code != 0
+    out = result.output + str(result.exception or "")
+    assert "--confirm-project-shared" in out
+    assert "git-tracked" in out
     # Source untouched on rejection.
     assert src.exists()
     comp.storage.update_chunks_scope_for_source.assert_not_called()
