@@ -30,7 +30,7 @@ from memtomem.config import (
     provider_for_category,
 )
 from memtomem.indexing.differ import DiffResult, compute_diff
-from memtomem.models import Chunk, ChunkMetadata, IndexingStats
+from memtomem.models import Chunk, IndexingStats
 
 if TYPE_CHECKING:
     from memtomem.embedding.base import EmbeddingProvider
@@ -1294,22 +1294,26 @@ def _build_merged_content(current: Chunk, nxt: Chunk, merged_hierarchy: tuple[st
 
 
 def _merge_pair(current: Chunk, nxt: Chunk) -> Chunk:
-    """Produce a single Chunk by merging ``current`` and ``nxt``."""
+    """Produce a single Chunk by merging ``current`` and ``nxt``.
+
+    Uses ``dataclasses.replace`` so any ``ChunkMetadata`` field added
+    after this code was written carries through the merge automatically
+    — explicit constructor arguments would silently drop new fields.
+    Today this matters for ``scope`` / ``project_root`` (ADR-0011) and
+    ``valid_from_unix`` / ``valid_to_unix`` (temporal-validity RFC),
+    all of which need to survive merge so search still respects scope
+    boundaries and validity windows on merged output. Mirrors
+    :meth:`_apply_namespace` / :meth:`_apply_scope`.
+    """
     hierarchy = _merged_hierarchy(current, nxt)
     content = _build_merged_content(current, nxt, hierarchy)
-    return Chunk(
-        content=content,
-        metadata=ChunkMetadata(
-            source_file=current.metadata.source_file,
-            heading_hierarchy=hierarchy,
-            chunk_type=current.metadata.chunk_type,
-            start_line=current.metadata.start_line,
-            end_line=nxt.metadata.end_line,
-            language=current.metadata.language,
-            tags=tuple(set(current.metadata.tags) | set(nxt.metadata.tags)),
-            namespace=current.metadata.namespace,
-        ),
+    new_meta = dataclasses.replace(
+        current.metadata,
+        heading_hierarchy=hierarchy,
+        end_line=nxt.metadata.end_line,
+        tags=tuple(set(current.metadata.tags) | set(nxt.metadata.tags)),
     )
+    return Chunk(content=content, metadata=new_meta)
 
 
 def _merge_short_chunks(
@@ -1452,17 +1456,11 @@ def _add_overlap(chunks: list[Chunk], overlap_tokens: int) -> list[Chunk]:
             parts.append(suffix)
 
         new_content = "\n".join(parts)
-        new_meta = ChunkMetadata(
-            source_file=c.metadata.source_file,
-            heading_hierarchy=c.metadata.heading_hierarchy,
-            chunk_type=c.metadata.chunk_type,
-            start_line=c.metadata.start_line,
-            end_line=c.metadata.end_line,
-            language=c.metadata.language,
-            tags=c.metadata.tags,
-            namespace=c.metadata.namespace,
-            overlap_before=ob,
-            overlap_after=oa,
-        )
+        # ``dataclasses.replace`` so future ``ChunkMetadata`` fields
+        # (scope / project_root / valid_from_unix / valid_to_unix /
+        # next-RFC additions) carry through automatically. Explicit
+        # constructor args would silently drop fields the merger
+        # doesn't know about — same rationale as :meth:`_merge_pair`.
+        new_meta = dataclasses.replace(c.metadata, overlap_before=ob, overlap_after=oa)
         result.append(Chunk(content=new_content, metadata=new_meta))
     return result

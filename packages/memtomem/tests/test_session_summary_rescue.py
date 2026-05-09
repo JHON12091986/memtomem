@@ -25,11 +25,20 @@ from memtomem.search.pipeline import SearchPipeline
 from memtomem.server.formatters import _format_structured_results
 
 
+# Symbolic anchor for chunk source paths. Tests use AsyncMock storage
+# so no real file IO happens against this path; it just identifies
+# chunks for boost-source comparisons. Picked so that ``Path`` does
+# the same thing on POSIX and Windows: forward-slash, no drive letter,
+# no expanduser/resolve needed downstream
+# (``feedback_windows_tmp_path_under_userprofile.md``).
+_CHUNK_SOURCE_BASE = "test-fixtures"
+
+
 def _chunk(content: str = "x", source: str = "a.md", namespace: str = "default") -> Chunk:
     return Chunk(
         content=content,
         metadata=ChunkMetadata(
-            source_file=Path(f"/tmp/{source}"),
+            source_file=Path(f"/{_CHUNK_SOURCE_BASE}/{source}"),
             namespace=namespace,
         ),
         embedding=[0.1] * 8,
@@ -182,7 +191,10 @@ class TestBoostSourcesHelper:
 
         pipeline = _make_pipeline(storage, session_summary_config=cfg)
         sources = await pipeline._session_summary_boost_sources("q")
-        assert {Path(s).as_posix() for s in sources} == {"/tmp/src/a.md", "/tmp/src/b.md"}
+        assert {Path(s).as_posix() for s in sources} == {
+            f"/{_CHUNK_SOURCE_BASE}/src/a.md",
+            f"/{_CHUNK_SOURCE_BASE}/src/b.md",
+        }
         # Walk used the correct link_type
         call_args = storage.get_chunks_shared_from.await_args
         assert call_args.kwargs.get("link_type") == "summarizes"
@@ -211,7 +223,7 @@ class TestBoostSourcesHelper:
         storage.bm25_search = AsyncMock(return_value=[])
         pipeline = _make_pipeline(storage, session_summary_config=cfg)
 
-        proj_root = Path("/tmp/proj_pin")
+        proj_root = Path(f"/{_CHUNK_SOURCE_BASE}/proj_pin")
         await pipeline._session_summary_boost_sources(
             "q",
             scope_filter=None,
@@ -336,7 +348,7 @@ class TestPipelineEndToEndRescue:
         storage.get_chunks_batch = AsyncMock(return_value={rescued.id: rescued})
 
         pipeline = _make_pipeline(storage, session_summary_config=cfg)
-        proj_root = Path("/tmp/proj_pinned")
+        proj_root = Path(f"/{_CHUNK_SOURCE_BASE}/proj_pinned")
         await pipeline.search("q", top_k=10, project_context_root=proj_root)
 
         # Every BM25 call (primary, summary lookup, rescue leg) should
@@ -416,7 +428,7 @@ class TestPipelineEndToEndRescue:
             config=SearchConfig(enable_bm25=True, enable_dense=True),
             session_summary_config=cfg,
         )
-        proj_root = Path("/tmp/proj_dense_pinned")
+        proj_root = Path(f"/{_CHUNK_SOURCE_BASE}/proj_dense_pinned")
         await pipeline.search("q", top_k=10, project_context_root=proj_root)
 
         # Both the primary and rescue dense calls must have received

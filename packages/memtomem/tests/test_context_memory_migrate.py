@@ -275,6 +275,101 @@ def test_memory_migrate_compensation_rolls_back_on_db_failure(monkeypatch, fake_
     assert not (proj_shared / "rule.md").exists()
 
 
+@pytest.mark.asyncio
+async def test_memory_migrate_compensation_real_backend_preserves_chunk_scope(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """ADR-0011 PR-D round 8 pin: rollback claim against a REAL SQLite
+    backend, not AsyncMock.
+
+    The earlier compensation test (above) only proved that the FS path
+    was restored when the (mocked) DB update raised — the AsyncMock
+    storage means a true SQL transactionality bug (e.g. partial UPDATE
+    + FS revert leaving the chunk row half-flipped) would not trip
+    the assertion (``feedback_mocked_storage_hides_sql_bugs.md``).
+    This test runs the same flow against the bm25_only_components
+    SQLite backend and pins:
+
+    1. FS path back at the original user-tier location.
+    2. The chunk row's persisted ``metadata.scope`` is STILL ``user``
+       and ``metadata.project_root`` is STILL ``None`` — the DB-level
+       state is consistent with the post-compensation FS state.
+    """
+    from memtomem.cli.context_cmd import _memory_migrate_run
+
+    comp, mem_dir = bm25_only_components
+    project_root = tmp_path / "proj_compensation"
+    proj_local = project_root / ".memtomem" / "memories.local"
+    proj_local.mkdir(parents=True)
+    (project_root / ".git").mkdir()
+    comp.config.indexing.project_memory_dirs = [proj_local]
+
+    src = mem_dir / "rule.md"
+    src.write_text("## Rule\n\nharmless body.\n", encoding="utf-8")
+
+    chunk = Chunk(
+        content="harmless body.",
+        metadata=ChunkMetadata(
+            source_file=src,
+            scope="user",
+            project_root=None,
+            start_line=3,
+            end_line=3,
+        ),
+        embedding=[0.1] * 1024,
+    )
+    await comp.storage.upsert_chunks([chunk])
+    pre_chunk_id = chunk.id
+
+    # Wrap the real backend so the DB UPDATE raises mid-flight. The
+    # FS move has already happened by the time the DB step runs, so
+    # the failure exercises the compensation branch
+    # (``cli/context_cmd.py``: filesystem rollback).
+    real_update = comp.storage.update_chunks_scope_for_source
+
+    async def _fail_update(*args, **kwargs):
+        raise RuntimeError("simulated DB failure")
+
+    monkeypatch.setattr(comp.storage, "update_chunks_scope_for_source", _fail_update)
+
+    _patch_cli_components(monkeypatch, comp)
+    monkeypatch.chdir(project_root)
+
+    with pytest.raises(Exception):  # SystemExit from click.ClickException
+        await _memory_migrate_run(
+            src.resolve(),
+            from_scope="user",
+            to_scope="project_local",
+            apply_=True,
+            yes=True,
+            confirm_project_shared=False,
+        )
+
+    # FS pin: source restored, project tier empty.
+    assert src.exists(), "FS rollback should restore source path"
+    assert not (proj_local / "rule.md").exists(), "project tier must be clean post-rollback"
+
+    # SQL pin: the chunk row's persisted metadata is still user-scope.
+    # If a future regression makes the DB UPDATE non-atomic with the
+    # FS revert (e.g. UPDATE commits before rollback fires), this
+    # assertion catches the half-flipped state — the AsyncMock
+    # variant would have happily returned whatever pre-staged value
+    # the mock's ``_fail_update`` sentinel was configured with.
+    refreshed = await comp.storage.get_chunk(pre_chunk_id)
+    assert refreshed is not None, "chunk row should still exist post-rollback"
+    assert refreshed.metadata.scope == "user", (
+        f"scope must remain 'user' after rollback, got {refreshed.metadata.scope!r}"
+    )
+    assert refreshed.metadata.project_root is None, (
+        f"project_root must remain None after rollback, got {refreshed.metadata.project_root!r}"
+    )
+    # And the chunk's source_file should still resolve to the original path.
+    assert refreshed.metadata.source_file == src
+
+    # Restore so other tests sharing the storage instance see the real method.
+    monkeypatch.setattr(comp.storage, "update_chunks_scope_for_source", real_update)
+
+
 # ---------------------------------------------------------------------------
 # 5) Pre-flight registration check (PR-D review round 5)
 # ---------------------------------------------------------------------------

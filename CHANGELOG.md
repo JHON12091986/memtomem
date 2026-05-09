@@ -7,6 +7,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Added
 
+- **Memory scope axis schema (ADR-0011 PR-B).** First-time start of an
+  upgraded server runs a one-shot SQLite migration that adds two new
+  columns to ``chunks``: ``scope TEXT NOT NULL DEFAULT 'user'`` (one
+  of ``user`` / ``project_shared`` / ``project_local``) and
+  ``project_root TEXT`` (the registered project root for project-tier
+  rows; ``NULL`` for user-tier). Every existing row backfills to
+  ``scope='user'`` so behaviour for current memtomem deployments is
+  unchanged on upgrade. Two new indexes
+  (``idx_chunks_scope (scope, project_root)``,
+  ``idx_chunks_project_root (project_root) WHERE project_root IS NOT
+  NULL``) cover the always-on default-merge filter shape. Migration is
+  idempotent — DB files already on the new schema are no-ops.
+- **`--scope` filter on `mm mem recall`, `mem_search`, `mem_recall`
+  (ADR-0011 PR-C).** Optional explicit scope filter accepts a single
+  value (``user``), a comma list (``user,project_local``), or a glob
+  (``project_*``). Without ``--scope`` the search falls into the
+  project-aware default merge (see Changed entry below).
 - **`mm mem add --scope` + `--confirm-project-shared` / `--yes` (CLI)
   (ADR-0011 PR-D).** The CLI ``add`` command now writes to one of three
   directories based on the resolved scope: ``~/.memtomem/memories``
@@ -55,6 +72,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Changed
 
+- **In-project default search merge — behaviour change (ADR-0011 PR-C).**
+  ``mem_search`` / ``mem_recall`` running with an MCP server cwd inside
+  a registered project (``project_memory_dirs`` covers the cwd) now
+  scope by default to ``user`` rows + the current project's
+  project_shared / project_local rows. Previously the same call
+  returned a cross-project union (every project's rows visible). The
+  fragment is composed via the new ``scope_context_sql`` helper and
+  applied unconditionally in the storage layer, so a caller cannot
+  accidentally drop the boundary by omitting an explicit scope.
+  Out-of-project searches still return user-tier only. **Upgrade
+  impact:** users who run memtomem from inside a project_memory_dirs-
+  covered cwd will see fewer results on the same query than they did
+  on 0.1.36 — the dropped rows lived in *other* projects'
+  project-tier directories. Pass ``--scope=project_*`` (CLI) /
+  ``scope='project_*'`` (MCP) to opt back into a cross-project search.
 - **`mem_edit` / `mem_delete` infer scope from the chunk's persisted
   `metadata.scope` (MCP) (ADR-0011 PR-D).** Editing or deleting a
   chunk that lives in ``project_shared`` is gated by the same

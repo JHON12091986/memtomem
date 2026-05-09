@@ -236,17 +236,23 @@ async def mem_consolidate_apply(
         c.metadata.project_root for c in chunks_map.values() if c.metadata.project_root is not None
     }
     if derived_scope in ("project_shared", "project_local") and len(source_project_roots) > 1:
+        sorted_roots = sorted(str(p) for p in source_project_roots)
         logger.warning(
             "mem_consolidate_apply: skipping group %s — mixed project_root values %s",
             group_id,
-            sorted(str(p) for p in source_project_roots),
+            sorted_roots,
         )
+        # Join paths with ", " (not Python list repr) so Windows backslash
+        # paths surface as literal ``C:\Users\...`` rather than the doubly-
+        # escaped ``C:\\\\Users\\\\...`` produced by ``str(list)``. Keeps
+        # the user-facing message readable AND lets the pin test's
+        # ``str(proj_a) in out`` substring check work cross-platform.
         return (
             f"Error: skipped group {group_id}: source chunks span multiple "
-            f"projects ({sorted(str(p) for p in source_project_roots)}). "
-            "A consolidated summary cannot pick one project_root without "
-            "discarding the others; re-run mem_consolidate with a "
-            "source_filter that pins a single project."
+            f"projects ({', '.join(sorted_roots)}). A consolidated summary "
+            "cannot pick one project_root without discarding the others; "
+            "re-run mem_consolidate with a source_filter that pins a single "
+            "project."
         )
     project_root_override: "Path | None" = (
         next(iter(source_project_roots)) if source_project_roots else None

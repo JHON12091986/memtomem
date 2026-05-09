@@ -27,15 +27,26 @@ def _validate_path(
     path_str: str,
     memory_dirs: list,
     project_memory_dirs: list | None = None,
+    *,
+    scope: str = "user",
+    project_root: Path | None = None,
 ) -> tuple[Path | None, str | None]:
     """Validate and resolve a user-supplied path.
 
-    Relative paths are resolved against the first memory_dir.
-    Absolute paths must live under one of ``memory_dirs`` or
-    ``project_memory_dirs`` (ADR-0011: project-tier writes need the
-    project's ``.memtomem/memories[.local]`` entries to count as
-    valid bases).
-    Returns (resolved_path, None) on success, or (None, error_message) on failure.
+    Relative paths default to the first user-tier ``memory_dir``. When
+    the caller passes an explicit project-tier ``scope`` together with a
+    ``project_root``, relative paths instead resolve under the matching
+    project tier (``<project_root>/.memtomem/memories[.local]``) so the
+    explicit scope kwarg is honoured (ADR-0011 PR-D round 8). Absolute
+    paths must live under one of ``memory_dirs`` or
+    ``project_memory_dirs``.
+
+    Without the scope/project_root override the function preserves its
+    historical behaviour for unmodified callers (e.g. ``mem_delete``
+    which never accepts a scope kwarg).
+
+    Returns (resolved_path, None) on success, or (None, error_message)
+    on failure.
     """
     raw = Path(path_str).expanduser()
     user_bases = [Path(d).expanduser().resolve() for d in (memory_dirs or [Path(".")])]
@@ -44,6 +55,33 @@ def _validate_path(
 
     if raw.is_absolute():
         target = raw.resolve()
+    elif scope in ("project_shared", "project_local"):
+        # ADR-0011 PR-D round 8 — explicit project-tier scope on a
+        # relative path: resolve under the requested tier base instead
+        # of ``user_bases[0]``. Without this branch ``classify_scope``
+        # downstream would see a user-tier path and silently flip the
+        # effective scope back to ``user``, dropping the caller's
+        # explicit project-scope intent.
+        if project_root is None:
+            return (
+                None,
+                (
+                    f"Error: scope='{scope}' with a relative file path "
+                    "requires a registered project context "
+                    "(no project_memory_dirs entry covers the current cwd)."
+                ),
+            )
+        from memtomem.memory_scope import (
+            MemoryScopeError,
+            resolve_memory_scope_dir,
+        )
+
+        try:
+            user_base = user_bases[0] if user_bases else Path("~/.memtomem/memories")
+            base = resolve_memory_scope_dir(scope, project_root, user_base=user_base)
+        except MemoryScopeError as exc:
+            return None, f"Error: {exc}"
+        target = (base / raw).resolve()
     else:
         # Resolve relative paths against the first user-tier memory_dir.
         # Project-tier roots are absolute-only; mixing them in here would
@@ -128,7 +166,28 @@ async def _mem_add_core(
     # ``mem_edit`` / ``mem_delete`` inferred-scope contract.
     target: Path | None = None
     if file:
-        target, err = _validate_path(file, mdirs, pmdirs)
+        # ADR-0011 PR-D round 8: thread caller's explicit scope into the
+        # path validator so a relative ``file=`` under project-tier
+        # scope resolves to the project's ``.memtomem/...`` directory
+        # instead of the user-tier base. Project root for the relative
+        # branch comes from the override (used by consolidate-apply for
+        # cross-project summaries) or the server-cwd resolver.
+        validate_project_root: Path | None = None
+        if scope in ("project_shared", "project_local"):
+            from memtomem.server.tools.search import _resolve_project_context_root
+
+            validate_project_root = (
+                project_root_override
+                if project_root_override is not None
+                else _resolve_project_context_root(app)
+            )
+        target, err = _validate_path(
+            file,
+            mdirs,
+            pmdirs,
+            scope=scope,
+            project_root=validate_project_root,
+        )
         if err:
             return (err, None)
         assert target is not None
@@ -664,7 +723,21 @@ async def mem_batch_add(
     # ``_mem_add_core`` inferred-scope contract.
     target: Path | None = None
     if file:
-        target, err = _validate_path(file, mdirs, pmdirs)
+        # ADR-0011 PR-D round 8: relative ``file=`` under project-tier
+        # scope must resolve to the project's tier base, not the user
+        # tier — see ``_mem_add_core`` for the rationale.
+        validate_project_root: Path | None = None
+        if scope in ("project_shared", "project_local"):
+            from memtomem.server.tools.search import _resolve_project_context_root
+
+            validate_project_root = _resolve_project_context_root(app)
+        target, err = _validate_path(
+            file,
+            mdirs,
+            pmdirs,
+            scope=scope,
+            project_root=validate_project_root,
+        )
         if err:
             return err
         assert target is not None

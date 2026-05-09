@@ -60,10 +60,17 @@ class TestMemEditRedactionGuard:
     """
 
     @staticmethod
-    def _stub_user_chunk(monkeypatch, comp):
+    def _stub_user_chunk(monkeypatch, comp, tmp_path):
         """Wire ``comp.storage.get_chunk`` to return a user-scope chunk
         so the edit-surface guard runs with scope='user' (the default
-        path the existing tests cover)."""
+        path the existing tests cover).
+
+        Source path is anchored at ``tmp_path`` (per-test isolation +
+        Windows portability — hardcoded ``/tmp/...`` paths trip the
+        ``$HOME``-tilde-rewrite under Windows CI's
+        ``C:\\Users\\runneradmin\\...`` HOME root, see
+        ``feedback_windows_tmp_path_under_userprofile.md``).
+        """
         from unittest.mock import AsyncMock
 
         from memtomem.models import Chunk, ChunkMetadata
@@ -71,7 +78,7 @@ class TestMemEditRedactionGuard:
         chunk = Chunk(
             content="placeholder",
             metadata=ChunkMetadata(
-                source_file=Path("/tmp/never_touched.md"),
+                source_file=tmp_path / "never_touched.md",
                 scope="user",
                 start_line=1,
                 end_line=2,
@@ -91,13 +98,15 @@ class TestMemEditRedactionGuard:
         monkeypatch.setattr(comp.index_engine, "index_file", _noop_index_file)
 
     @pytest.mark.asyncio
-    async def test_blocks_secret_and_records_blocked(self, bm25_only_components, monkeypatch):
+    async def test_blocks_secret_and_records_blocked(
+        self, bm25_only_components, monkeypatch, tmp_path
+    ):
         """Secret content rejected without ``force_unsafe``; counter
         increments under the ``mem_edit`` ``by_tool`` key (not
         ``mem_add``) so the guard's surface attribution stays observable.
         """
         comp, mem_dir = bm25_only_components
-        self._stub_user_chunk(monkeypatch, comp)
+        self._stub_user_chunk(monkeypatch, comp, tmp_path)
         app = AppContext.from_components(comp)
         ctx = StubCtx(app)
 
@@ -117,9 +126,11 @@ class TestMemEditRedactionGuard:
         assert after["blocked"] == before["blocked"] + 1
 
     @pytest.mark.asyncio
-    async def test_force_unsafe_records_bypassed(self, bm25_only_components, caplog, monkeypatch):
+    async def test_force_unsafe_records_bypassed(
+        self, bm25_only_components, caplog, monkeypatch, tmp_path
+    ):
         comp, mem_dir = bm25_only_components
-        self._stub_user_chunk(monkeypatch, comp)
+        self._stub_user_chunk(monkeypatch, comp, tmp_path)
         app = AppContext.from_components(comp)
         ctx = StubCtx(app)
 
@@ -141,9 +152,9 @@ class TestMemEditRedactionGuard:
         assert "sk-" not in caplog.text
 
     @pytest.mark.asyncio
-    async def test_clean_content_records_pass(self, bm25_only_components, monkeypatch):
+    async def test_clean_content_records_pass(self, bm25_only_components, monkeypatch, tmp_path):
         comp, mem_dir = bm25_only_components
-        self._stub_user_chunk(monkeypatch, comp)
+        self._stub_user_chunk(monkeypatch, comp, tmp_path)
         app = AppContext.from_components(comp)
         ctx = StubCtx(app)
 

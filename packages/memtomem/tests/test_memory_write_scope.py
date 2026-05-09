@@ -151,13 +151,17 @@ async def test_mem_add_default_user_scope_force_unsafe_still_works(bm25_only_com
 
 @pytest.mark.asyncio
 async def test_mem_edit_inferred_scope_blocks_project_shared_force_unsafe(
-    bm25_only_components, monkeypatch
+    bm25_only_components, monkeypatch, tmp_path
 ):
     comp, _mem_dir = bm25_only_components
     app = AppContext.from_components(comp)
     ctx = StubCtx(app)
 
-    proj = Path("/tmp/proj_x")
+    # Anchor under tmp_path so Windows CI's
+    # ``$HOME=C:\Users\runneradmin\AppData\Local\Temp\...`` does not
+    # rewrite the path through tilde-expansion downstream
+    # (``feedback_windows_tmp_path_under_userprofile.md``).
+    proj = tmp_path / "proj_x"
     chunk_id = uuid4()
     fake_chunk = Chunk(
         content="original",
@@ -234,6 +238,83 @@ async def test_mem_edit_inferred_user_scope_force_unsafe_proceeds(
 # Scope-aware write target — MCP mem_add lands in the right tier directory
 # (PR-D review #9: gate alone is not enough; metadata must persist scope.)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mem_add_relative_file_under_project_shared_scope_lands_in_project_tier(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """ADR-0011 PR-D round 8 P2 pin: a relative ``file=`` path with
+    explicit ``scope='project_shared'`` must resolve under the project
+    tier (``<project>/.memtomem/memories/``), not under
+    ``memory_dirs[0]``.
+
+    The pre-fix shape: ``_validate_path("team.md", mdirs, pmdirs)``
+    resolved the relative path against ``user_bases[0]`` regardless
+    of caller-supplied ``scope=``. ``classify_scope`` then saw a
+    user-tier path and silently flipped the effective scope back to
+    ``user`` — so the explicit project_shared kwarg was ignored, the
+    write landed in user memory, and Gate B's confirm requirement
+    never fired (user-tier writes do not trigger it).
+    """
+    comp, _user_mem_dir = bm25_only_components
+    project_root = tmp_path / "proj_relative"
+    proj_dir = project_root / ".memtomem" / "memories"
+    proj_dir.mkdir(parents=True)
+    comp.config.indexing.project_memory_dirs = [proj_dir]
+
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: project_root,
+    )
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await memory_crud.mem_add(
+        content="harmless team rule",
+        file="team.md",  # RELATIVE — the bug-shape this pins.
+        scope="project_shared",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    # Successful write to the PROJECT tier.
+    assert "Memory added to" in out, out
+    expected = proj_dir / "team.md"
+    assert str(expected) in out, f"summary did not land in project tier: {out}"
+    # Negative: must not have written to user tier.
+    assert str(_user_mem_dir / "team.md") not in out
+    # Metadata pin — chunks persist project_shared scope.
+    chunks = await comp.storage.list_chunks_by_source(expected)
+    assert chunks, "expected at least one chunk indexed under project_shared"
+    for c in chunks:
+        assert c.metadata.scope == "project_shared", c.metadata.scope
+        assert c.metadata.project_root == project_root
+
+
+@pytest.mark.asyncio
+async def test_mem_add_relative_file_project_scope_without_context_errors(
+    bm25_only_components, monkeypatch
+):
+    """Companion negative pin: explicit project scope on a relative file
+    with NO registered project context errors clearly instead of
+    silently falling back to user tier."""
+    comp, _ = bm25_only_components
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: None,
+    )
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await memory_crud.mem_add(
+        content="rule",
+        file="team.md",
+        scope="project_shared",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "Error" in out
+    assert "registered project context" in out
 
 
 @pytest.mark.asyncio
