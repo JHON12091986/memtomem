@@ -228,3 +228,135 @@ async def test_mem_edit_inferred_user_scope_force_unsafe_proceeds(
     assert "force_unsafe=True is not permitted" not in out
     snap = privacy.snapshot()
     assert snap["by_tool"]["mem_edit"]["bypassed"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Scope-aware write target — MCP mem_add lands in the right tier directory
+# (PR-D review #9: gate alone is not enough; metadata must persist scope.)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mem_add_project_shared_writes_to_project_dir_and_persists_metadata(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """``mem_add(scope='project_shared', confirm=True)`` must:
+
+    1. Land the file under ``<project>/.memtomem/memories/`` (not the
+       user-tier ``memory_dirs[0]``).
+    2. Persist ``metadata.scope == 'project_shared'`` and
+       ``metadata.project_root == <project_root>`` on every indexed
+       chunk so the read surface (PR-C ``ScopeFilter``) sees the
+       correct tier.
+    """
+    comp, _user_mem_dir = bm25_only_components
+    project_root = tmp_path / "proj_a"
+    (project_root / ".memtomem" / "memories").mkdir(parents=True)
+    # Register the project tier with the indexer so the scope classifier
+    # tags chunks with project_shared on re-index.
+    comp.config.indexing.project_memory_dirs = [project_root / ".memtomem" / "memories"]
+
+    # Pin project_root resolution to this test's fixture (real
+    # ``_resolve_project_context_root`` walks cwd; tmp_path may not
+    # cover it portably).
+    from memtomem.server.tools import memory_crud as _mc
+
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: project_root,
+    )
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await _mc.mem_add(
+        content="harmless team rule",
+        scope="project_shared",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "Memory added to" in out
+    # File location pin.
+    assert str(project_root / ".memtomem" / "memories") in out
+    # Metadata pin: indexed chunks carry scope+project_root.
+    chunks = await comp.storage.list_chunks_by_source(
+        next((project_root / ".memtomem" / "memories").glob("*.md"))
+    )
+    assert chunks, "expected at least one chunk indexed under project_shared"
+    for c in chunks:
+        assert c.metadata.scope == "project_shared", c.metadata.scope
+        assert c.metadata.project_root == project_root, c.metadata.project_root
+
+
+@pytest.mark.asyncio
+async def test_mem_add_project_shared_without_project_context_errors(
+    bm25_only_components, monkeypatch
+):
+    """No registered project tier → ``scope='project_shared'`` errors clearly."""
+    comp, _ = bm25_only_components
+    # project_memory_dirs is empty by default in the fixture.
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: None,
+    )
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await memory_crud.mem_add(
+        content="rule",
+        scope="project_shared",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "Error" in out
+    assert "registered project context" in out
+
+
+@pytest.mark.asyncio
+async def test_mem_batch_add_project_shared_writes_to_project_dir(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """Batch path mirrors single-add scope-aware target dir."""
+    comp, _ = bm25_only_components
+    project_root = tmp_path / "proj_b"
+    (project_root / ".memtomem" / "memories").mkdir(parents=True)
+    comp.config.indexing.project_memory_dirs = [project_root / ".memtomem" / "memories"]
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: project_root,
+    )
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await memory_crud.mem_batch_add(
+        entries=[{"key": "k1", "value": "v1"}, {"key": "k2", "value": "v2"}],
+        scope="project_shared",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "Batch add complete" in out
+    assert str(project_root / ".memtomem" / "memories") in out
+
+
+def test_validate_path_accepts_project_memory_dirs(tmp_path):
+    """``_validate_path`` rejects absolute paths outside both base lists,
+    accepts paths under either ``memory_dirs`` or ``project_memory_dirs``.
+    """
+    user_dir = tmp_path / "user_mem"
+    user_dir.mkdir()
+    project_dir = tmp_path / "proj" / ".memtomem" / "memories"
+    project_dir.mkdir(parents=True)
+
+    # Path under project_memory_dirs is accepted only when the helper
+    # is told about that base.
+    project_file = project_dir / "x.md"
+    out, err = memory_crud._validate_path(str(project_file), [user_dir], None)
+    assert err is not None  # rejected without project base
+    out, err = memory_crud._validate_path(str(project_file), [user_dir], [project_dir])
+    assert err is None
+    assert out == project_file.resolve()
+
+    # Outside-of-everything stays rejected.
+    bogus = tmp_path / "elsewhere" / "y.md"
+    bogus.parent.mkdir()
+    bogus.write_text("x")
+    out, err = memory_crud._validate_path(str(bogus), [user_dir], [project_dir])
+    assert err is not None

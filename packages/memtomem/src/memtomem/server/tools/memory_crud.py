@@ -23,20 +23,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _validate_path(path_str: str, memory_dirs: list) -> tuple[Path | None, str | None]:
+def _validate_path(
+    path_str: str,
+    memory_dirs: list,
+    project_memory_dirs: list | None = None,
+) -> tuple[Path | None, str | None]:
     """Validate and resolve a user-supplied path.
 
     Relative paths are resolved against the first memory_dir.
+    Absolute paths must live under one of ``memory_dirs`` or
+    ``project_memory_dirs`` (ADR-0011: project-tier writes need the
+    project's ``.memtomem/memories[.local]`` entries to count as
+    valid bases).
     Returns (resolved_path, None) on success, or (None, error_message) on failure.
     """
     raw = Path(path_str).expanduser()
-    bases = [Path(d).expanduser().resolve() for d in (memory_dirs or [Path(".")])]
+    user_bases = [Path(d).expanduser().resolve() for d in (memory_dirs or [Path(".")])]
+    project_bases = [Path(d).expanduser().resolve() for d in (project_memory_dirs or [])]
+    bases = user_bases + project_bases
 
     if raw.is_absolute():
         target = raw.resolve()
     else:
-        # Resolve relative paths against the first memory_dir
-        target = (bases[0] / raw).resolve()
+        # Resolve relative paths against the first user-tier memory_dir.
+        # Project-tier roots are absolute-only; mixing them in here would
+        # surprise existing callers that pass plain filenames.
+        target = (user_bases[0] / raw).resolve()
 
     if not any(target.is_relative_to(b) for b in bases):
         return None, "Error: path is outside configured memory directories."
@@ -142,17 +154,38 @@ async def _mem_add_core(
             return (f"Error: {exc}\n\nAvailable templates:\n{list_templates()}", None)
 
     mdirs = app.config.indexing.memory_dirs
+    pmdirs = app.config.indexing.project_memory_dirs
 
     if file:
-        target, err = _validate_path(file, mdirs)
+        target, err = _validate_path(file, mdirs, pmdirs)
         if err:
             return (err, None)
     else:
-        base = app.config.indexing.memory_dirs[0] if app.config.indexing.memory_dirs else Path(".")
+        # ADR-0011: route the default-dated file to the canonical
+        # directory for the requested scope. Without this branch, MCP
+        # ``mem_add(scope='project_shared')`` would still write to the
+        # user-tier path even though the gate accepted the call — the
+        # CLI/MCP divergence flagged in PR-D review.
+        from memtomem.memory_scope import (
+            MemoryScopeError,
+            resolve_memory_scope_dir,
+        )
+        from memtomem.server.tools.search import _resolve_project_context_root
+
+        if scope == "user":
+            base = mdirs[0] if mdirs else Path(".")
+            base = Path(base).expanduser().resolve()
+        else:
+            project_root = _resolve_project_context_root(app)
+            try:
+                base = resolve_memory_scope_dir(scope, project_root, user_base=Path(mdirs[0]))
+            except MemoryScopeError as exc:
+                return (f"Error: {exc}", None)
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        target = Path(base).expanduser().resolve() / f"{date_str}.md"
+        target = base / f"{date_str}.md"
 
     assert target is not None
+    target.parent.mkdir(parents=True, exist_ok=True)
     await asyncio.to_thread(append_entry, target, content, title=title, tags=tags)
 
     effective_ns = namespace or _resolve_agent_namespace(app, None)
@@ -387,6 +420,7 @@ async def mem_delete(
     chunk_id: str | None = None,
     source_file: str | None = None,
     namespace: str | None = None,
+    confirm_project_shared: bool = False,
     ctx: CtxType = None,
 ) -> str:
     """Delete memory entries from the index (and optionally from the source file).
@@ -396,11 +430,15 @@ async def mem_delete(
     When source_file is given, all chunks from that file are removed from the
     index (the file itself is NOT deleted).
     When namespace is given, all chunks in that namespace are removed from the index.
+    ADR-0011: deleting project_shared chunks requires
+    ``confirm_project_shared=True``. Bulk source deletes are all-or-nothing:
+    if any matched chunk is project_shared, the whole source delete is rejected.
 
     Args:
         chunk_id: UUID of a specific chunk to delete
         source_file: Path to remove all indexed chunks from
         namespace: Namespace to delete all chunks from
+        confirm_project_shared: Required for project_shared chunks
     """
     from memtomem.tools.memory_writer import remove_lines
 
@@ -417,6 +455,16 @@ async def mem_delete(
             return f"Error: chunk {chunk_id} not found."
 
         meta = chunk.metadata
+        inferred_scope = meta.scope or "user"
+        if inferred_scope == "project_shared" and not confirm_project_shared:
+            logger.info(
+                "mem_delete rejected project_shared chunk without confirmation",
+                extra={"chunk_id": chunk_id, "scope": inferred_scope},
+            )
+            return (
+                "Error: deleting scope='project_shared' chunks requires "
+                "confirm_project_shared=True."
+            )
         # Backup for rollback on indexing failure
         original = await asyncio.to_thread(meta.source_file.read_text, encoding="utf-8")
         try:
@@ -439,10 +487,25 @@ async def mem_delete(
         )
 
     if source_file:
-        sf_path, sf_err = _validate_path(source_file, app.config.indexing.memory_dirs)
+        sf_path, sf_err = _validate_path(
+            source_file,
+            app.config.indexing.memory_dirs,
+            app.config.indexing.project_memory_dirs,
+        )
         if sf_err:
             return sf_err
         assert sf_path is not None
+        scopes = await app.storage.list_scopes_by_source(sf_path)
+        if "project_shared" in scopes and not confirm_project_shared:
+            logger.info(
+                "mem_delete rejected bulk project_shared source without confirmation",
+                extra={"source_file": str(sf_path), "scopes": sorted(scopes)},
+            )
+            return (
+                "Error: source_file delete would remove scope='project_shared' chunks; "
+                "pass confirm_project_shared=True to proceed. Bulk source deletes are "
+                "all-or-nothing; use chunk_id for per-chunk control."
+            )
         deleted = await app.storage.delete_by_source(sf_path)
         app.search_pipeline.invalidate_cache()
         return f"Removed {deleted} chunks from index for {source_file}"
@@ -595,17 +658,37 @@ async def mem_batch_add(
     if mismatch_msg:
         return mismatch_msg
     mdirs = app.config.indexing.memory_dirs
+    pmdirs = app.config.indexing.project_memory_dirs
 
     if file:
-        target, err = _validate_path(file, mdirs)
+        target, err = _validate_path(file, mdirs, pmdirs)
         if err:
             return err
     else:
-        base = app.config.indexing.memory_dirs[0] if app.config.indexing.memory_dirs else Path(".")
+        # ADR-0011: scope-aware default-dated file target. Mirrors
+        # ``_mem_add_core`` so MCP ``mem_batch_add(scope='project_shared')``
+        # lands in the project's ``.memtomem/memories/`` directory, not
+        # the user-tier path.
+        from memtomem.memory_scope import (
+            MemoryScopeError,
+            resolve_memory_scope_dir,
+        )
+        from memtomem.server.tools.search import _resolve_project_context_root
+
+        if scope == "user":
+            base = mdirs[0] if mdirs else Path(".")
+            base = Path(base).expanduser().resolve()
+        else:
+            project_root = _resolve_project_context_root(app)
+            try:
+                base = resolve_memory_scope_dir(scope, project_root, user_base=Path(mdirs[0]))
+            except MemoryScopeError as exc:
+                return f"Error: {exc}"
         date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        target = Path(base).expanduser().resolve() / f"{date_str}.md"
+        target = base / f"{date_str}.md"
 
     assert target is not None
+    target.parent.mkdir(parents=True, exist_ok=True)
     skipped = 0
     for entry in entries:
         key = entry.get("key") or entry.get("title", "")

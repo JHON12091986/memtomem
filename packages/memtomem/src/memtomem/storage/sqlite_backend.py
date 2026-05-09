@@ -659,6 +659,55 @@ class SqliteBackend(
             raise StorageError(f"delete_by_source failed, transaction rolled back: {exc}") from exc
         return len(rows)
 
+    async def list_scopes_by_source(self, source_file: Path) -> set[str]:
+        """Return the distinct persisted scopes for chunks from ``source_file``."""
+        db = self._get_read_db()
+        rows = db.execute(
+            "SELECT DISTINCT COALESCE(scope, 'user') FROM chunks WHERE source_file=?",
+            (norm_path(source_file),),
+        ).fetchall()
+        return {str(row[0] or "user") for row in rows}
+
+    async def update_chunks_scope_for_source(
+        self,
+        old_path: Path,
+        new_path: Path,
+        new_scope: str,
+        new_project_root: Path | None,
+    ) -> int:
+        """Move indexed chunks to a new source path and scope without changing IDs."""
+        db = self._get_db()
+        old_norm = norm_path(old_path)
+        new_norm = norm_path(new_path)
+        project_root = str(new_project_root) if new_project_root else None
+        rows = db.execute(
+            "SELECT rowid FROM chunks WHERE source_file=?",
+            (old_norm,),
+        ).fetchall()
+        if not rows:
+            return 0
+        rowids = [row[0] for row in rows]
+        try:
+            db.execute(
+                "UPDATE chunks SET source_file=?, scope=?, project_root=?, "
+                "updated_at=CURRENT_TIMESTAMP WHERE source_file=?",
+                (new_norm, new_scope, project_root, old_norm),
+            )
+            db.execute(
+                f"UPDATE chunks_fts SET source_file=? "
+                f"WHERE rowid IN ({placeholders(len(rowids))})",
+                [new_norm, *rowids],
+            )
+            if not self._in_transaction:
+                db.commit()
+        except Exception as exc:
+            if not self._in_transaction:
+                db.rollback()
+            raise StorageError(
+                f"update_chunks_scope_for_source failed, transaction rolled back: {exc}"
+            ) from exc
+        return len(rowids)
+
     async def rebuild_fts(self) -> int:
         """Rebuild the FTS5 index from chunks table using current tokenizer.
 
