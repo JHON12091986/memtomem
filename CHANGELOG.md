@@ -140,6 +140,31 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
 
 ### Fixed
 
+- **ADR-0011 PR-D review round 9 — read surfaces thread project
+  context onto the always-on scope filter.** Round 7 introduced the
+  always-on scope-context fragment in
+  ``storage/sqlite_scope.scope_context_sql`` so missing
+  ``project_context_root`` defaults to ``scope='user'`` only. The
+  primary ``mem_search`` / ``mem_recall`` callers were updated, but
+  every other read surface kept calling ``search_pipeline.search`` /
+  ``storage.recall_chunks`` without the kwarg — silently dropping
+  project_shared / project_local rows for any caller running inside a
+  registered project. Threaded the resolver through:
+  - MCP tools: ``mem_ask``, ``mem_temporal_search``,
+    ``mem_procedure_list``, ``mem_agent_search``,
+    ``_mem_add_core``'s post-write duplicate check, the
+    ``recall_chunks`` calls in ``mem_session_summary`` and
+    ``mem_reflect_save``.
+  - CLI surfaces: interactive shell ``search``, ``ask``, and
+    ``recall`` commands.
+  - Web routes: ``GET /search``, ``GET /timeline``.
+  - LangGraph integration: ``MemtomemStore.search``.
+  Web routes that don't have an ``app``/``comp`` wrapper use a new
+  ``_resolve_project_context_from_dirs(project_memory_dirs)`` helper
+  alongside the existing ``_resolve_project_context_root(app)``
+  variant. New AST-scanning guard in
+  ``tests/test_scope_context_threading.py`` fails CI if a future
+  call site forgets the kwarg.
 - **ADR-0011 PR-D review round 7 — cross-project leak in
   `mem_consolidate_apply`.** `mem_consolidate` enumerates source files
   globally so a project-tier group can come from a project that is not

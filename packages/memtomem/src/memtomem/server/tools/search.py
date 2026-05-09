@@ -29,26 +29,17 @@ from memtomem.server.webhooks import webhook_error_cb
 logger = logging.getLogger(__name__)
 
 
-def _resolve_project_context_root(app) -> Path | None:
-    """Find the registered project root that contains the current cwd.
+def _resolve_project_context_from_dirs(project_memory_dirs) -> Path | None:
+    """Same as :func:`_resolve_project_context_root` but takes the dirs
+    list directly (no ``app`` / ``comp`` wrapper).
 
-    Returns the project root for the current process, or ``None`` if no
-    registered project tier covers the current cwd. Used by MCP read
-    tools as the always-on context-boundary anchor (ADR-0011 §6) so a
-    memtomem server started from inside a project naturally pins memory
-    queries to that project's project_shared / project_local rows.
-
-    Resolution: for each ``project_memory_dir`` registered in the user
-    config, derive its project root (the grandparent of the
-    ``.memtomem/memories[.local]`` entry); if the current cwd lives
-    under that root, return it. Multiple matching roots → return the
-    deepest match (most specific project context wins for nested
-    project layouts).
-
-    Empty ``project_memory_dirs`` → ``None``. Permission errors during
-    resolve → ``None``.
+    Used by web routes that have ``Mem2MemConfig`` directly via
+    ``get_config`` and by any caller that already extracted the
+    registered project tier list. The wrapper :func:`_resolve_project_context_root`
+    delegates here so MCP tool callers (``app``) and CLI callers
+    (``comp``) keep their existing one-arg signature.
     """
-    project_dirs = list(app.config.indexing.project_memory_dirs)
+    project_dirs = list(project_memory_dirs)
     if not project_dirs:
         return None
     try:
@@ -77,6 +68,32 @@ def _resolve_project_context_root(app) -> Path | None:
             best_depth = depth
             best_root = project_root
     return best_root
+
+
+def _resolve_project_context_root(app) -> Path | None:
+    """Find the registered project root that contains the current cwd.
+
+    Returns the project root for the current process, or ``None`` if no
+    registered project tier covers the current cwd. Used by MCP read
+    tools as the always-on context-boundary anchor (ADR-0011 §6) so a
+    memtomem server started from inside a project naturally pins memory
+    queries to that project's project_shared / project_local rows.
+
+    Resolution: for each ``project_memory_dir`` registered in the user
+    config, derive its project root (the grandparent of the
+    ``.memtomem/memories[.local]`` entry); if the current cwd lives
+    under that root, return it. Multiple matching roots → return the
+    deepest match (most specific project context wins for nested
+    project layouts).
+
+    Empty ``project_memory_dirs`` → ``None``. Permission errors during
+    resolve → ``None``.
+
+    Accepts either ``app`` (MCP) or ``comp`` (CLI) — both expose
+    ``.config.indexing.project_memory_dirs`` so the duck-typed access
+    is symmetric.
+    """
+    return _resolve_project_context_from_dirs(app.config.indexing.project_memory_dirs)
 
 
 @mcp.tool()

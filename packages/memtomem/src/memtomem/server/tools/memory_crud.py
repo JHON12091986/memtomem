@@ -323,7 +323,18 @@ async def _mem_add_core(
     # Semantic duplicate check: warn if very similar content already exists
     try:
         if len(content) > 20:
-            similar, _ = await app.search_pipeline.search(content, top_k=5)
+            # ADR-0011 PR-D round 9: thread project context so the
+            # duplicate check sees the same scope set the just-written
+            # chunk lives under. Without this, a project_shared write
+            # would only get matched against user-tier candidates and
+            # genuine in-project duplicates would slip through.
+            from memtomem.server.tools.search import _resolve_project_context_root
+
+            similar, _ = await app.search_pipeline.search(
+                content,
+                top_k=5,
+                project_context_root=effective_project_root or _resolve_project_context_root(app),
+            )
             dupes = [
                 s
                 for s in similar
