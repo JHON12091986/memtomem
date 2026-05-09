@@ -383,6 +383,70 @@ async def test_cache_key_distinct_per_project_context(storage, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_dense_search_adaptive_overfetch_recovers_from_cross_project_skew(storage, tmp_path):
+    """PR-D review (round 2) pin: adaptive over-fetch ensures valid
+    scoped matches surface even when the KNN cutoff is dominated by
+    other-project chunks.
+
+    Fixed over-fetch (``top_k * 5`` = 10 at top_k=2) was too small
+    when 200+ cross-project chunks have closer embeddings than the
+    current-project match — sqlite-vec's KNN limit ran before the
+    outer scope filter, so scoped matches just beyond the cutoff
+    were silently dropped. Adaptive retry escalates to a larger
+    inner K when the post-filter result is short of ``top_k``.
+    """
+    proj_a = tmp_path / "proj_a"
+    proj_b = tmp_path / "proj_b"
+    proj_a.mkdir()
+    proj_b.mkdir()
+
+    # 200 cross-project chunks all clustered near the query.
+    near_emb = [1.0] * 1023 + [0.0]
+    far_emb = [0.5] * 1024
+
+    b_chunks = [
+        Chunk(
+            content=f"proj_b noise {i}",
+            metadata=ChunkMetadata(
+                source_file=proj_b / ".memtomem" / "memories" / f"b{i}.md",
+                scope="project_shared",
+                project_root=proj_b,
+                namespace="default",
+            ),
+            embedding=near_emb,
+        )
+        for i in range(200)
+    ]
+    a_chunk = Chunk(
+        content="proj_a target chunk",
+        metadata=ChunkMetadata(
+            source_file=proj_a / ".memtomem" / "memories" / "a.md",
+            scope="project_shared",
+            project_root=proj_a,
+            namespace="default",
+        ),
+        embedding=far_emb,
+    )
+    await storage.upsert_chunks(b_chunks + [a_chunk])
+
+    # Query is closer to ``near_emb`` than ``far_emb`` — under the
+    # old fixed K=10 the proj_a chunk would be ranked ~201st by KNN
+    # and never reach the outer filter at top_k=2.
+    query_emb = [1.0] * 1023 + [0.001]
+    results = await storage.dense_search(
+        query_emb,
+        top_k=2,
+        project_context_root=proj_a,
+    )
+    contents = {r.chunk.content for r in results}
+    # Adaptive retry surfaces proj_a's match despite the heavier
+    # cross-project cluster nearer to the query.
+    assert "proj_a target chunk" in contents
+    # Cross-project leak still prevented.
+    assert not any(c.startswith("proj_b noise") for c in contents)
+
+
+@pytest.mark.asyncio
 async def test_bm25_search_filters_inside_candidate_selection(storage, tmp_path):
     """PR-D review #2 pin: scope/namespace filter must run inside the
     FTS candidate selection, not after a post-LIMIT join.

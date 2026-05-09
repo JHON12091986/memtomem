@@ -891,40 +891,72 @@ class SqliteBackend(
 
         import sqlite3 as _sqlite3
 
-        # ADR-0011 §6 + PR-D review #2: sqlite-vec's ``embedding MATCH ?``
-        # uses the inner ``LIMIT`` as the KNN ``K`` — moving the
-        # namespace / scope filter outside the subquery without
-        # over-fetching K would let cross-project chunks crowd out
-        # current-project matches, returning too few or zero results
-        # even when matching rows exist just below the cutoff.
-        # Inside the inner subquery the vec extension still drives K,
-        # so the cleanest fix is to over-fetch by a fixed factor and
-        # cap the post-filter result with an outer LIMIT.
-        overfetch = max(top_k * 5, 100)
+        # ADR-0011 §6 + PR-D review (round 2): sqlite-vec's
+        # ``embedding MATCH ?`` uses the inner ``LIMIT`` as the KNN
+        # ``K`` — the namespace / scope filter must run outside that
+        # subquery, so the inner K decides how many candidates the
+        # outer filter is allowed to see. A *fixed* over-fetch (e.g.
+        # ``top_k * 5``) silently drops valid scoped matches when
+        # cross-project / cross-namespace skew exceeds that factor.
+        #
+        # Adaptive over-fetch: try a small K first (fast for the
+        # common case where filter passes nearly everything), and if
+        # the post-filter result is short of ``top_k`` AND the inner
+        # K did not exhaust ``chunks_vec`` (i.e. there could still be
+        # filter-passing matches beyond the cutoff), retry with a
+        # larger K. Cap retries at the table size so the worst case
+        # is "scan every embedding once," which matches the semantics
+        # the caller would expect from "find me the nearest scoped
+        # row."
+        sql = f"""SELECT c.*, sub.distance
+               FROM (
+                   SELECT rowid, distance
+                   FROM chunks_vec
+                   WHERE embedding MATCH ?
+                   ORDER BY distance
+                   LIMIT ?
+               ) sub
+               JOIN chunks c ON c.rowid = sub.rowid {ns_clause} {scope_clause}
+               ORDER BY sub.distance, {tie_break}
+               LIMIT ?"""
 
-        try:
-            rows = db.execute(
-                f"""SELECT c.*, sub.distance
-                   FROM (
-                       SELECT rowid, distance
-                       FROM chunks_vec
-                       WHERE embedding MATCH ?
-                       ORDER BY distance
-                       LIMIT ?
-                   ) sub
-                   JOIN chunks c ON c.rowid = sub.rowid {ns_clause} {scope_clause}
-                   ORDER BY sub.distance, {tie_break}
-                   LIMIT ?""",
-                [serialize_f32(embedding), overfetch] + ns_params + scope_params + [top_k],
-            ).fetchall()
-        except _sqlite3.OperationalError as exc:
-            if "Dimension mismatch" in str(exc):
-                raise ValueError(
-                    f"Embedding dimension mismatch: query has {len(embedding)}d "
-                    f"but DB expects {self._dimension}d. "
-                    f"Check MEMTOMEM_EMBEDDING__MODEL / MEMTOMEM_EMBEDDING__DIMENSION."
-                ) from exc
-            raise
+        # Total embedding rows — the upper bound for a meaningful
+        # KNN K. Cheap; sqlite stores chunks_vec row counts in its
+        # internal stats and ``COUNT(*)`` is O(table-size) only on
+        # the rare cold-cache path.
+        total_vec_rows = db.execute("SELECT count(*) FROM chunks_vec").fetchone()[0] or 0
+
+        # Schedule: start at the previous fixed factor for the
+        # common case, then jump to "essentially unbounded" before
+        # giving up. Stop early when an attempt either returned
+        # ``top_k`` rows OR already saw every embedding.
+        attempts = [
+            max(top_k * 5, 100),
+            max(top_k * 50, 1000),
+            total_vec_rows,
+        ]
+        rows: list = []
+        for inner_k in attempts:
+            inner_k = max(1, min(inner_k, total_vec_rows or inner_k))
+            try:
+                rows = db.execute(
+                    sql,
+                    [serialize_f32(embedding), inner_k] + ns_params + scope_params + [top_k],
+                ).fetchall()
+            except _sqlite3.OperationalError as exc:
+                if "Dimension mismatch" in str(exc):
+                    raise ValueError(
+                        f"Embedding dimension mismatch: query has {len(embedding)}d "
+                        f"but DB expects {self._dimension}d. "
+                        f"Check MEMTOMEM_EMBEDDING__MODEL / "
+                        f"MEMTOMEM_EMBEDDING__DIMENSION."
+                    ) from exc
+                raise
+            # Done if we hit the requested top_k OR if this attempt
+            # already scanned every embedding (cannot do better by
+            # retrying).
+            if len(rows) >= top_k or inner_k >= (total_vec_rows or 0):
+                break
 
         return [
             SearchResult(

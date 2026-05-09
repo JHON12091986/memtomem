@@ -149,6 +149,20 @@ async def _add(
             f"Content matches {len(guard.hits)} privacy pattern(s); write rejected. "
             "Retry with --force-unsafe to bypass (audit-logged)."
         )
+    if guard.decision == "blocked_project_shared":
+        # ADR-0011 §5: ``force_unsafe=True`` is hard-refused on
+        # ``project_shared`` writes — git history is forever, so
+        # the bypass valve does not exist on this tier. The MCP
+        # surface enforces the same refusal; the CLI must mirror
+        # it or ``mm mem add --scope project_shared --force-unsafe``
+        # would still land flagged content in the git-tracked tier.
+        raise click.ClickException(
+            f"Content matches {len(guard.hits)} privacy pattern(s) and "
+            "--force-unsafe is not permitted on --scope project_shared "
+            "(git history is forever). Retry with --scope project_local "
+            "or --scope user to bypass; manually edit the canonical file "
+            "if a project_shared write is required."
+        )
 
     async with cli_components() as comp:
         project_root = _resolve_project_context_root(comp)

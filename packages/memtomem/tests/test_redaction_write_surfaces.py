@@ -188,6 +188,31 @@ class TestCliMmAddRedactionGuard:
         snap = privacy.snapshot()["by_tool"].get("cli_mm_add", {})
         assert snap.get("blocked", 0) == 1
 
+    def test_blocks_force_unsafe_secret_on_project_shared_scope(self):
+        """ADR-0011 §5: ``force_unsafe=True`` on ``project_shared`` is
+        hard-refused at the chokepoint. The CLI surface must mirror the
+        MCP refusal — without this branch ``mm mem add --scope
+        project_shared --force-unsafe`` would still land flagged content
+        in the git-tracked tier.
+        """
+        from memtomem.cli.memory import add as add_cmd
+
+        runner = CliRunner()
+        with patch("memtomem.cli._bootstrap.cli_components") as mock_bootstrap:
+            mock_bootstrap.assert_not_called()
+            result = runner.invoke(
+                add_cmd,
+                [_SECRET_SAMPLE, "--scope", "project_shared", "--force-unsafe", "--yes"],
+            )
+            mock_bootstrap.assert_not_called()
+
+        assert result.exit_code != 0
+        out = result.output + str(result.exception or "")
+        assert "force-unsafe is not permitted" in out
+        assert "git history is forever" in out
+        snap = privacy.snapshot()["by_tool"].get("cli_mm_add", {})
+        assert snap.get("blocked_project_shared", 0) == 1
+
     def test_clean_content_records_pass_in_cli_surface(self, monkeypatch, tmp_path):
         """A clean write still talks to ``cli_components`` — to keep the
         unit fast we stub the bootstrap so no real DB is created. The
