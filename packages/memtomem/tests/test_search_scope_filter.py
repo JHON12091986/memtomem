@@ -43,7 +43,13 @@ class TestScopeContextSqlNoFilter:
     def test_with_project_context_unions_user_and_project(self):
         frag, params = scope_context_sql(None, Path("/proj/a"))
         assert frag == "(scope = 'user' OR project_root = ?)"
-        assert params == ["/proj/a"]
+        # Compare against ``str(Path(...))`` so the test matches the
+        # native-path stringification on every OS (Windows produces
+        # ``\\proj\\a``; POSIX produces ``/proj/a``). The chunks table
+        # stores ``project_root`` via ``str(metadata.project_root)`` too,
+        # so the query param matches stored rows on the same OS — cross-
+        # OS DB sharing is a separate concern.
+        assert params == [str(Path("/proj/a"))]
 
 
 class TestScopeContextSqlExplicitFilter:
@@ -54,7 +60,7 @@ class TestScopeContextSqlExplicitFilter:
         # boundary so cross-project leak is impossible.
         assert "scope IN (?)" in frag
         assert "project_root = ?" in frag
-        assert params == ["project_shared", "/proj/a"]
+        assert params == ["project_shared", str(Path("/proj/a"))]
 
     def test_exact_filter_no_project_unions_cross_project(self):
         f = ScopeFilter.parse("project_shared")

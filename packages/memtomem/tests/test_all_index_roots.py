@@ -108,6 +108,10 @@ class TestConsumerRegressionPin:
         # tier; PR-D revisits with --scope flag).
         "memtomem/cli/agent_cmd.py",
         "memtomem/cli/shell.py",
+        # ``mm mem add`` user-tier base derivation (ADR-0011 PR-D round 7
+        # BLOCKER fix): the CLI must read ``memory_dirs[0]`` so writes
+        # land in the same user-tier directory MCP ``_mem_add_core`` uses.
+        "memtomem/cli/memory.py",
         # Sync-doctor reads/writes the user-tier registry directly.
         "memtomem/cli/sync_doctor_cmd.py",
         # ``mm context memory-migrate`` derives the user-tier base
@@ -138,7 +142,13 @@ class TestConsumerRegressionPin:
         pat = re.compile(r"\.indexing\.memory_dirs\b|_config\.memory_dirs\b|self\.memory_dirs\b")
         offenders: list[tuple[str, int, str]] = []
         for py_file in SRC_ROOT.rglob("*.py"):
-            rel = str(py_file)
+            # ADR-0011 PR-D review round 7: normalize to forward-slash via
+            # ``as_posix()`` before allowlist match. ``rglob`` returns
+            # native paths (backslash on Windows); the allowlist suffixes
+            # are forward-slash literals like ``memtomem/cli/agent_cmd.py``.
+            # Without normalization every Windows file falls through the
+            # allowlist and the test fails the entire src tree.
+            rel = py_file.as_posix()
             if any(rel.endswith(s) for s in self._ALLOWED_DIRECT_ACCESS_SUFFIXES):
                 continue
             try:

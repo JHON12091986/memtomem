@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 from typing import Any
 
 from memtomem.server import mcp
@@ -221,6 +222,35 @@ async def mem_consolidate_apply(
             "narrower filter so each group spans a single scope tier."
         )
     derived_scope = next(iter(source_scopes), "user") if source_scopes else "user"
+    # ADR-0011 PR-D review round 7: enumerate the source chunks'
+    # persisted ``project_root`` values too. ``mem_consolidate`` walks
+    # source files globally, so a project-tier group can come from a
+    # project that is NOT the MCP server's current cwd. Without the
+    # override below, ``_mem_add_core`` would resolve the write target
+    # via ``_resolve_project_context_root(app)`` (server cwd) and the
+    # summary would land in the wrong project's ``.memtomem`` tier (or
+    # fail when the server is not inside any project). Pin the override
+    # to the source chunks' shared project_root; refuse mixed-project
+    # groups so the summary cannot silently span project boundaries.
+    source_project_roots = {
+        c.metadata.project_root for c in chunks_map.values() if c.metadata.project_root is not None
+    }
+    if derived_scope in ("project_shared", "project_local") and len(source_project_roots) > 1:
+        logger.warning(
+            "mem_consolidate_apply: skipping group %s — mixed project_root values %s",
+            group_id,
+            sorted(str(p) for p in source_project_roots),
+        )
+        return (
+            f"Error: skipped group {group_id}: source chunks span multiple "
+            f"projects ({sorted(str(p) for p in source_project_roots)}). "
+            "A consolidated summary cannot pick one project_root without "
+            "discarding the others; re-run mem_consolidate with a "
+            "source_filter that pins a single project."
+        )
+    project_root_override: "Path | None" = (
+        next(iter(source_project_roots)) if source_project_roots else None
+    )
     if derived_scope == "project_shared" and not confirm_project_shared:
         return (
             f"Error: group {group_id} sources live in scope='project_shared'. "
@@ -248,6 +278,7 @@ async def mem_consolidate_apply(
         ctx=ctx,
         scope=derived_scope,
         confirm_project_shared=confirm_project_shared,
+        project_root_override=project_root_override,
     )
 
     if stats is None or not stats.new_chunk_ids:

@@ -306,6 +306,19 @@ def create_tables(
         CREATE INDEX IF NOT EXISTS idx_chunks_scope
         ON chunks(scope, project_root)
     """)
+    # ADR-0011 PR-D review round 7: partial sibling index on
+    # ``project_root`` alone. The dominant in-project filter shape is
+    # ``(scope='user' OR project_root=?)`` — the OR's second leg cannot
+    # use ``idx_chunks_scope`` because ``project_root`` is the trailing
+    # column behind ``scope``. Without this partial index the second
+    # leg degrades to a full scan once a user accumulates project-tier
+    # chunks. Partial (``WHERE project_root IS NOT NULL``) keeps the
+    # index small for the user-tier majority case.
+    db.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chunks_project_root
+        ON chunks(project_root)
+        WHERE project_root IS NOT NULL
+    """)
 
     # --- Personalization tables ---
     db.execute("""

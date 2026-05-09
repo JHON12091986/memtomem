@@ -669,6 +669,116 @@ async def test_mem_consolidate_apply_project_shared_requires_confirm(
     assert "confirm_project_shared=True" in out
 
 
+@pytest.mark.asyncio
+async def test_mem_consolidate_apply_pins_summary_to_source_project(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """ADR-0011 PR-D review round 7 pin: cross-project leak fix.
+
+    Source chunks live in ``proj_a`` but the MCP server's cwd is in
+    ``proj_b`` (simulated via ``_resolve_project_context_root`` patch).
+    Without the override the summary would land in
+    ``proj_b/.memtomem/memories`` and ``link_consolidation_relations``
+    would tie the original ``proj_a`` chunks to a summary in a foreign
+    project. The override pins the write target to the source chunks'
+    persisted ``metadata.project_root`` so the summary lands beside
+    the originals.
+    """
+    from memtomem.server.tools import consolidation
+
+    comp, _ = bm25_only_components
+    proj_a = tmp_path / "proj_a"
+    proj_a_dir = proj_a / ".memtomem" / "memories"
+    proj_a_dir.mkdir(parents=True)
+    proj_b = tmp_path / "proj_b"
+    proj_b_dir = proj_b / ".memtomem" / "memories"
+    proj_b_dir.mkdir(parents=True)
+    src = proj_a_dir / "rules.md"
+    src.write_text("## hi\n\nproject content\n")
+
+    # Both project tiers registered so the destination registration
+    # check inside ``_mem_add_core`` accepts proj_a's directory.
+    comp.config.indexing.project_memory_dirs = [proj_a_dir, proj_b_dir]
+
+    # Server cwd resolves to proj_b — without the override this is the
+    # project the summary would have been written into.
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: proj_b,
+    )
+
+    chunks = [
+        _fake_chunk("project_shared", src, "shared one"),
+        _fake_chunk("project_shared", src, "shared two"),
+    ]
+    await _stage_consolidate_group(comp, chunks, group_id=0)
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await consolidation.mem_consolidate_apply(
+        group_id=0,
+        summary="combined team rule",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "Consolidation applied" in out or "Memory added to" in out, out
+    # Summary file path mentions proj_a's directory, not proj_b's.
+    assert str(proj_a_dir) in out, f"summary did not land in proj_a tier: {out}"
+    assert str(proj_b_dir) not in out, f"summary leaked into proj_b tier (cross-project): {out}"
+
+
+@pytest.mark.asyncio
+async def test_mem_consolidate_apply_mixed_project_roots_refuses(
+    bm25_only_components, monkeypatch, tmp_path
+):
+    """ADR-0011 PR-D review round 7 pin: refuse a project-tier group whose
+    source chunks span multiple ``project_root`` values.
+
+    A mixed-project group cannot pick a single destination tier without
+    discarding the others, so consolidation is refused before the write
+    step. Mirrors the mixed-scope rejection a few lines above.
+    """
+    from memtomem.server.tools import consolidation
+
+    comp, _ = bm25_only_components
+    proj_a = tmp_path / "proj_a"
+    proj_a_dir = proj_a / ".memtomem" / "memories"
+    proj_a_dir.mkdir(parents=True)
+    proj_b = tmp_path / "proj_b"
+    proj_b_dir = proj_b / ".memtomem" / "memories"
+    proj_b_dir.mkdir(parents=True)
+    a_src = proj_a_dir / "a.md"
+    a_src.write_text("## hi\n\nA team rule\n")
+    b_src = proj_b_dir / "b.md"
+    b_src.write_text("## hi\n\nB team rule\n")
+
+    comp.config.indexing.project_memory_dirs = [proj_a_dir, proj_b_dir]
+    monkeypatch.setattr(
+        "memtomem.server.tools.search._resolve_project_context_root",
+        lambda app: proj_a,
+    )
+
+    chunks = [
+        _fake_chunk("project_shared", a_src, "from A"),
+        _fake_chunk("project_shared", b_src, "from B"),
+    ]
+    await _stage_consolidate_group(comp, chunks, group_id=0)
+
+    app = AppContext.from_components(comp)
+    ctx = StubCtx(app)
+    out = await consolidation.mem_consolidate_apply(
+        group_id=0,
+        summary="combined",
+        confirm_project_shared=True,
+        ctx=ctx,
+    )
+    assert "skipped group 0" in out
+    assert "multiple projects" in out
+    # Both project paths cited so the caller can act on the conflict.
+    assert str(proj_a) in out
+    assert str(proj_b) in out
+
+
 def test_validate_path_accepts_project_memory_dirs(tmp_path):
     """``_validate_path`` rejects absolute paths outside both base lists,
     accepts paths under either ``memory_dirs`` or ``project_memory_dirs``.

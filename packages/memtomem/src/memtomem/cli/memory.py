@@ -166,7 +166,17 @@ async def _add(
 
     async with cli_components() as comp:
         project_root = _resolve_project_context_root(comp)
-        user_base = Path("~/.memtomem/memories")
+        # ADR-0011 PR-D review round 7: ``mm mem add user_base`` must
+        # read from ``indexing.memory_dirs[0]`` so the CLI agrees with
+        # MCP ``_mem_add_core`` and ``mm context memory-migrate`` —
+        # users who remap ``memory_dirs`` would otherwise see split
+        # writes between CLI and MCP. The hardcoded literal stays only
+        # as a fallback for the (unsupported) empty-list case.
+        mdirs = comp.config.indexing.memory_dirs
+        if mdirs:
+            user_base = Path(mdirs[0]).expanduser()
+        else:
+            user_base = Path("~/.memtomem/memories").expanduser()
         base = _resolve_memory_scope_dir(scope, project_root, user_base)
         if scope != "user":
             from memtomem.memory_scope import (
@@ -189,13 +199,23 @@ async def _add(
             date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
             target = (base / f"{date_str}.md").resolve()
 
-        if (
-            scope == "project_shared"
-            and not confirm_project_shared
-            and not yes
-            and not _prompt_project_shared_confirm(target)
-        ):
-            raise click.Abort()
+        # ADR-0011 PR-D review round 7: Gate B for project_shared must
+        # require an explicit ``--confirm-project-shared`` regardless of
+        # ``--yes``. ``--yes`` is a generic "skip prompts" flag users
+        # alias for unrelated reasons; treating it as Gate B satisfaction
+        # would let ``mm mem add --scope project_shared --yes`` silently
+        # write to git-tracked tier without an explicit project-shared
+        # opt-in (MCP ``mem_add`` requires ``confirm_project_shared=True``
+        # regardless — CLI parity).
+        if scope == "project_shared" and not confirm_project_shared:
+            if yes:
+                raise click.ClickException(
+                    "--scope project_shared requires --confirm-project-shared. "
+                    "--yes alone is not sufficient: project_shared writes go to "
+                    "the git-tracked memory tier and require explicit opt-in."
+                )
+            if not _prompt_project_shared_confirm(target):
+                raise click.Abort()
 
         target.parent.mkdir(parents=True, exist_ok=True)
         append_entry(target, content, title=title, tags=tags)

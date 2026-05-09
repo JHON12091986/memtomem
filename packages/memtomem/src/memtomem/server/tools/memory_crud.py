@@ -67,6 +67,7 @@ async def _mem_add_core(
     force_unsafe: bool = False,
     scope: str = "user",
     confirm_project_shared: bool = False,
+    project_root_override: Path | None = None,
 ) -> tuple[str, "IndexingStats | None"]:
     """Core logic for ``mem_add`` — also usable from internal callers that
     need the ``IndexingStats`` (e.g. ``mem_consolidate_apply`` linking new
@@ -76,6 +77,15 @@ async def _mem_add_core(
     requires explicit caller intent. ``project_shared`` additionally
     requires ``confirm_project_shared=True`` (the gate-B confirm
     surrogate for MCP callers; the CLI uses an interactive prompt).
+
+    ``project_root_override`` pins the project tier write target to a
+    specific project regardless of the MCP server's current cwd. Used
+    by ``mem_consolidate_apply`` so a summary written from chunks that
+    live under ``/projA`` lands in ``/projA/.memtomem/...`` even when
+    the server itself is running with cwd in ``/projB``. Without this,
+    ``_resolve_project_context_root(app)`` would resolve to the server
+    cwd and the summary would silently cross project boundaries
+    (ADR-0011 PR-D review round 7).
 
     Returns:
         Tuple of ``(user_facing_message, stats)``. ``stats`` is ``None``
@@ -205,7 +215,15 @@ async def _mem_add_core(
             base = mdirs[0] if mdirs else Path(".")
             base = Path(base).expanduser().resolve()
         else:
-            project_root = _resolve_project_context_root(app)
+            # ADR-0011 PR-D review round 7: prefer the explicit
+            # ``project_root_override`` (set by ``mem_consolidate_apply``
+            # to the source chunks' persisted project_root) over the
+            # server-cwd fallback so cross-project summaries land in
+            # the source project's tier, not the server's project.
+            if project_root_override is not None:
+                project_root = project_root_override
+            else:
+                project_root = _resolve_project_context_root(app)
             try:
                 base = resolve_memory_scope_dir(
                     effective_scope, project_root, user_base=Path(mdirs[0])

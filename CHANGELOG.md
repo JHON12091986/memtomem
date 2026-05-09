@@ -106,6 +106,63 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
   `_write_config_and_summary`) now invoke it before
   `_atomic_write_json`.
 
+### Fixed
+
+- **ADR-0011 PR-D review round 7 — cross-project leak in
+  `mem_consolidate_apply`.** `mem_consolidate` enumerates source files
+  globally so a project-tier group can come from a project that is not
+  the MCP server's current cwd. The apply path now derives the
+  destination project root from the source chunks' persisted
+  `metadata.project_root` (rejecting groups that span multiple
+  projects) and threads it into `_mem_add_core` via a new
+  `project_root_override` kwarg, so the summary lands in the source
+  project's `.memtomem/...` tier instead of being silently routed to
+  the server-cwd project.
+- **ADR-0011 PR-D review round 7 — `mm mem add` user-tier base.**
+  `cli/memory.py` now reads `comp.config.indexing.memory_dirs[0]`
+  to derive the user-tier base, matching MCP `_mem_add_core` and
+  `mm context memory-migrate`. The previous hardcoded
+  `Path("~/.memtomem/memories")` literal split CLI/MCP writes for
+  any user who remapped `memory_dirs` — exactly the divergence PR-D
+  was meant to close.
+- **ADR-0011 PR-D review round 7 — web PATCH/DELETE Gate B.**
+  `PATCH /api/chunks/{id}` now infers scope from the loaded chunk's
+  `metadata.scope` and feeds it into `enforce_write_guard`, so a
+  `force_unsafe` edit on a project_shared chunk hits the same hard
+  refusal MCP `mem_edit` enforces (mirrors memory_crud.py:406-413).
+  `DELETE /api/chunks/{id}` adds a `confirm_project_shared` query
+  parameter and refuses without it for project_shared chunks, mirroring
+  the MCP `mem_delete` round-3 fix.
+- **ADR-0011 PR-D review round 7 — `--yes` no longer satisfies Gate B.**
+  `mm mem add --scope project_shared --yes` (without
+  `--confirm-project-shared`) now exits with a clear error rather than
+  silently writing to the git-tracked tier. `--yes` is a generic
+  "skip prompts" flag users alias for unrelated reasons; treating it
+  as an explicit project-shared opt-in broke CLI/MCP parity (MCP
+  `mem_add` requires `confirm_project_shared=True` regardless).
+- **ADR-0011 PR-D review round 7 — `StorageBackend` Protocol drift.**
+  `bm25_search` / `dense_search` / `recall_chunks` Protocol signatures
+  in `storage/base.py` now declare `scope_filter` and
+  `project_context_root` kwargs (default `None`), aligning with the
+  `sqlite_backend` implementation. Without these, alternate backends
+  silently dropped the always-on scope-context fragment.
+- **ADR-0011 PR-D review round 7 — `idx_chunks_project_root` partial
+  index.** New partial index `(project_root) WHERE project_root IS
+  NOT NULL` covers the dominant in-project filter shape
+  `(scope='user' OR project_root=?)`. The composite
+  `idx_chunks_scope (scope, project_root)` could not serve the OR's
+  second leg because `project_root` is the trailing column; once a
+  user opts into project tiers and accumulates rows, that leg
+  degraded to a full table scan. Partial index keeps storage cheap
+  for the user-tier majority case.
+- **ADR-0011 PR-D review round 7 — Windows CI green.** Two test fixes:
+  the `_ALLOWED_DIRECT_ACCESS_SUFFIXES` allowlist in
+  `test_all_index_roots.py` now matches via `Path.as_posix()` so
+  Windows backslash paths still hit forward-slash entries; the
+  `scope_context_sql` parameter assertions in
+  `test_search_scope_filter.py` use `str(Path(...))` so the test
+  matches native-path stringification on every OS.
+
 ### Documentation
 
 - **Obsidian as editor on top of git transport.** New section in the

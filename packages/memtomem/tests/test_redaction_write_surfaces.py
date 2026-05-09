@@ -255,6 +255,51 @@ class TestCliMmAddRedactionGuard:
         # so a user following the message would hit a dead-end.
         assert "mm config set" not in out
 
+    def test_yes_flag_does_not_satisfy_gate_b_for_project_shared(self, monkeypatch, tmp_path):
+        """ADR-0011 PR-D review round 7 pin: ``--yes`` alone is NOT
+        sufficient for ``--scope project_shared`` writes.
+
+        ``--yes`` is a generic "skip prompts" flag users alias for
+        unrelated reasons (e.g. piping to non-interactive tooling).
+        Treating it as Gate B satisfaction would let a script
+        ``mm mem add --scope project_shared --yes`` silently land
+        contents in the git-tracked memory tier without an explicit
+        project-shared opt-in. MCP ``mem_add`` requires an explicit
+        ``confirm_project_shared=True`` regardless — the CLI must
+        keep parity. ``--confirm-project-shared`` remains the only
+        affirmative opt-in.
+        """
+        from contextlib import asynccontextmanager
+
+        proj_root = tmp_path / "proj_share"
+        proj_dir = proj_root / ".memtomem" / "memories"
+        proj_dir.mkdir(parents=True)
+
+        @asynccontextmanager
+        async def _fake_components():
+            comp = MagicMock()
+            comp.config.indexing.memory_dirs = [tmp_path / "user_mem"]
+            comp.config.indexing.project_memory_dirs = [proj_dir]
+            yield comp
+
+        monkeypatch.setattr("memtomem.cli._bootstrap.cli_components", _fake_components)
+        monkeypatch.setattr(
+            "memtomem.server.tools.search._resolve_project_context_root",
+            lambda comp: proj_root,
+        )
+
+        from memtomem.cli.memory import add as add_cmd
+
+        runner = CliRunner()
+        result = runner.invoke(
+            add_cmd,
+            [_CLEAN_SAMPLE, "--scope", "project_shared", "--yes"],
+        )
+        assert result.exit_code != 0, "--yes alone must not satisfy Gate B for project_shared"
+        out = result.output + str(result.exception or "")
+        assert "--confirm-project-shared" in out
+        assert "git-tracked" in out
+
     def test_clean_content_records_pass_in_cli_surface(self, monkeypatch, tmp_path):
         """A clean write still talks to ``cli_components`` — to keep the
         unit fast we stub the bootstrap so no real DB is created. The
@@ -267,9 +312,19 @@ class TestCliMmAddRedactionGuard:
         """
         from contextlib import asynccontextmanager
 
+        # ADR-0011 PR-D review round 7 BLOCKER fix: ``_add`` reads
+        # ``comp.config.indexing.memory_dirs[0]`` to derive the user-tier
+        # base. Set a real Path so the unset-MagicMock chain does not
+        # leak ``MagicMock/...`` directories into the repo cwd when the
+        # test's mkdir + index pipeline runs.
+        user_dir = tmp_path / "user_mem"
+        user_dir.mkdir()
+
         @asynccontextmanager
         async def _fake_components():
             comp = MagicMock()
+            comp.config.indexing.memory_dirs = [user_dir]
+            comp.config.indexing.project_memory_dirs = []
             comp.index_engine = AsyncMock()
             comp.storage = AsyncMock()
             comp.index_engine.index_file = AsyncMock(return_value=MagicMock(indexed_chunks=1))
