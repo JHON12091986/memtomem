@@ -110,6 +110,11 @@ class TestConsumerRegressionPin:
         "memtomem/cli/shell.py",
         # Sync-doctor reads/writes the user-tier registry directly.
         "memtomem/cli/sync_doctor_cmd.py",
+        # ``mm context memory-migrate`` derives the user-tier base
+        # directory for ``resolve_memory_scope_dir``; legitimately
+        # user-tier-only — fan-out across project tiers is not the
+        # intent here (ADR-0011 PR-D).
+        "memtomem/cli/context_cmd.py",
         # LangGraph adapter resolves user-tier write target.
         "memtomem/integrations/langgraph.py",
         # Session / URL / importer / memory_crud tools all derive a
