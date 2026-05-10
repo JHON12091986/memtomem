@@ -24,10 +24,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+import click
+
+from memtomem import privacy
 from memtomem.context import _skip_reasons as skip_codes
 from memtomem.context import override as _override
 from memtomem.context._atomic import atomic_write_bytes, copy_tree_atomic
+from memtomem.context._gate_a import format_project_shared_block_message
+from memtomem.config import TargetScope
 from memtomem.context._names import GENERATOR_VENDOR, InvalidNameError, validate_name
+from memtomem.context._runtime_targets import runtime_fanout_root
+from memtomem.context.scope_resolver import canonical_artifact_dir
 
 logger = logging.getLogger(__name__)
 
@@ -36,13 +43,23 @@ SKILL_MANIFEST = "SKILL.md"
 
 
 class SkillGenerator(Protocol):
-    """Protocol for runtime-specific skill targets."""
+    """Protocol for runtime-specific skill targets.
+
+    ADR-0011 PR-E: ``target_dir`` accepts a ``scope`` keyword (default
+    ``project_shared``). Returns ``None`` when no fan-out by design.
+    """
 
     name: str
     output_root: str  # relative to project root, e.g. ".claude/skills"
 
-    def target_dir(self, project_root: Path, skill_name: str) -> Path:
-        """Return the directory that should hold the rendered skill."""
+    def target_dir(
+        self,
+        project_root: Path,
+        skill_name: str,
+        *,
+        scope: TargetScope = "project_shared",
+    ) -> Path | None:
+        """Return the directory that should hold the rendered skill (or ``None``)."""
         ...
 
 
@@ -61,8 +78,15 @@ class ClaudeSkillsGenerator:
     name: str = "claude_skills"
     output_root: str = ".claude/skills"
 
-    def target_dir(self, project_root: Path, skill_name: str) -> Path:
-        return project_root / self.output_root / skill_name
+    def target_dir(
+        self,
+        project_root: Path,
+        skill_name: str,
+        *,
+        scope: TargetScope = "project_shared",
+    ) -> Path | None:
+        root = runtime_fanout_root("skills", "claude", scope, project_root)
+        return None if root is None else root / skill_name
 
 
 @dataclass
@@ -70,8 +94,15 @@ class GeminiSkillsGenerator:
     name: str = "gemini_skills"
     output_root: str = ".gemini/skills"
 
-    def target_dir(self, project_root: Path, skill_name: str) -> Path:
-        return project_root / self.output_root / skill_name
+    def target_dir(
+        self,
+        project_root: Path,
+        skill_name: str,
+        *,
+        scope: TargetScope = "project_shared",
+    ) -> Path | None:
+        root = runtime_fanout_root("skills", "gemini", scope, project_root)
+        return None if root is None else root / skill_name
 
 
 @dataclass
@@ -82,8 +113,15 @@ class CodexSkillsGenerator:
     # slight amount of on-disk overlap — Gemini will silently de-dup it).
     output_root: str = ".agents/skills"
 
-    def target_dir(self, project_root: Path, skill_name: str) -> Path:
-        return project_root / self.output_root / skill_name
+    def target_dir(
+        self,
+        project_root: Path,
+        skill_name: str,
+        *,
+        scope: TargetScope = "project_shared",
+    ) -> Path | None:
+        root = runtime_fanout_root("skills", "codex", scope, project_root)
+        return None if root is None else root / skill_name
 
 
 _register(ClaudeSkillsGenerator())
@@ -207,12 +245,22 @@ def generate_all_skills(
             continue
         for skill_dir in canonicals:
             dst = gen.target_dir(project_root, skill_dir.name)
+            # ADR-0011 PR-E: target_dir may return None for scopes with no
+            # fan-out (default scope=project_shared never None here).
+            assert dst is not None, (
+                f"{target} target_dir returned None for default project_shared scope"
+            )
             copy_skill(skill_dir, dst)
             # ADR-0008 Invariant 4: per-vendor override replaces SKILL.md only.
             # Auxiliary files (scripts/, references/) stay from canonical.
             vendor = GENERATOR_VENDOR.get(target)
             if vendor is not None:
-                override_path = _override.resolve(project_root, "skills", skill_dir.name, vendor)
+                # ADR-0011 PR-E: pin scope=project_shared (see agents.py for
+                # the same rationale — default sync must not see draft
+                # project_local overrides).
+                override_path = _override.resolve(
+                    project_root, "skills", skill_dir.name, vendor, scope="project_shared"
+                )
                 if override_path is not None:
                     atomic_write_bytes(
                         dst / SKILL_MANIFEST,
@@ -230,60 +278,157 @@ def extract_skills_to_canonical(
     project_root: Path,
     overwrite: bool = False,
     only_name: str | None = None,
+    *,
+    scope: TargetScope = "project_shared",
+    force_unsafe_import: bool = False,
 ) -> ExtractResult:
-    """Import existing runtime skills into ``.memtomem/skills/``.
+    """Import existing runtime skills into the scoped canonical directory.
 
     When the same skill name appears in multiple runtimes, the first one wins
-    (deterministic order: ``claude_skills`` before ``gemini_skills`` per the
-    ``SKILL_DIRS`` ordering in :mod:`memtomem.context.detector`).
-    Existing canonical entries are preserved unless ``overwrite=True``.
+    (deterministic order: claude → gemini → codex). Existing canonical
+    entries are preserved unless ``overwrite=True``.
 
-    Returns an :class:`ExtractResult` with both imported paths and skipped
-    items so the caller can warn the user about silent deduplication.
+    ADR-0011 PR-E2: ``scope`` selects both the canonical destination
+    (:func:`canonical_artifact_dir`) and the source runtime root
+    (:func:`runtime_fanout_root` per scope — ``user`` reads
+    ``~/.claude/skills`` etc.). ``project_local`` short-circuits to an
+    empty result with ``NO_PROJECT_FANOUT_FOR_RUNTIME``.
+
+    Gate A walks every file in the source skill tree (``rglob``) — secrets
+    routinely live in ``scripts/*.py`` and ``references/*.md`` rather
+    than just ``SKILL.md``. The skill is **atomic**: a single blocked
+    file aborts that skill's import without copying any of its files.
+    ``project_shared`` destinations hard-abort via :class:`click.ClickException`
+    on the first hit (with or without ``force_unsafe_import``).
 
     When ``only_name`` is set, every runtime entry with a different name is
-    silently skipped before any validation/dedupe work. Callers (e.g. the
-    single-item import route) can detect "no such runtime artifact" by
-    inspecting an empty ``imported`` + ``skipped``.
+    silently skipped before any validation/dedupe work.
     """
-    # Lazy import to avoid cycles at module import time.
-    from memtomem.context.detector import detect_skill_dirs
+    if scope == "project_local":
+        return ExtractResult(
+            imported=[],
+            skipped=[
+                (
+                    "<all>",
+                    "project_local has no runtime fan-out (ADR-0011 §3)",
+                    skip_codes.NO_PROJECT_FANOUT_FOR_RUNTIME,
+                )
+            ],
+        )
 
-    canonical_root = canonical_skills_root(project_root)
+    canonical_root = canonical_artifact_dir("skills", scope, project_root)
     imported: list[Path] = []
     skipped: list[tuple[str, str, skip_codes.SkipCode]] = []
     seen: dict[str, str] = {}  # skill_name → first runtime label
 
-    for detected in detect_skill_dirs(project_root):
-        skill_name = detected.path.name
-        if only_name is not None and skill_name != only_name:
-            continue
-        runtime_label = detected.agent  # e.g. "claude_skills"
+    for runtime in ("claude", "gemini", "codex"):
         try:
-            validate_name(skill_name, kind="skill name")
-        except InvalidNameError as exc:
-            skipped.append((skill_name, f"invalid name: {exc}", skip_codes.INVALID_NAME))
-            logger.warning(
-                "skip %r from %s: invalid name",
-                skill_name,
-                runtime_label,
-            )
+            runtime_dir = runtime_fanout_root("skills", runtime, scope, project_root)
+        except KeyError:
             continue
-        if skill_name in seen:
-            reason = f"already imported from {seen[skill_name]}"
-            skipped.append((skill_name, reason, skip_codes.ALREADY_IMPORTED))
-            logger.warning("skip %s from %s: %s", skill_name, runtime_label, reason)
+        if runtime_dir is None or not runtime_dir.is_dir():
             continue
-        dst = canonical_root / skill_name
-        if dst.exists() and not overwrite:
-            reason = "canonical exists (use --overwrite)"
-            skipped.append((skill_name, reason, skip_codes.CANONICAL_EXISTS))
-            logger.warning("skip %s from %s: %s", skill_name, runtime_label, reason)
+        runtime_label = f"{runtime} ({runtime_dir})"
+        for skill_dir in sorted(runtime_dir.iterdir()):
+            if not skill_dir.is_dir() or not (skill_dir / SKILL_MANIFEST).is_file():
+                continue
+            skill_name = skill_dir.name
+            if only_name is not None and skill_name != only_name:
+                continue
+            try:
+                validate_name(skill_name, kind="skill name")
+            except InvalidNameError as exc:
+                skipped.append((skill_name, f"invalid name: {exc}", skip_codes.INVALID_NAME))
+                logger.warning("skip %r from %s: invalid name", skill_name, runtime_label)
+                continue
+            if skill_name in seen:
+                reason = f"already imported from {seen[skill_name]}"
+                skipped.append((skill_name, reason, skip_codes.ALREADY_IMPORTED))
+                logger.warning("skip %s from %s: %s", skill_name, runtime_label, reason)
+                continue
+            dst = canonical_root / skill_name
+            if dst.exists() and not overwrite:
+                reason = "canonical exists (use --overwrite)"
+                skipped.append((skill_name, reason, skip_codes.CANONICAL_EXISTS))
+                logger.warning("skip %s from %s: %s", skill_name, runtime_label, reason)
+                seen[skill_name] = runtime_label
+                continue
+
+            # Gate A — walk every file in the skill tree before copying.
+            # One blocked file aborts the whole skill (atomic — never
+            # leave a partial copy in canonical).
+            blocked_file: Path | None = None
+            blocked_decision: str | None = None
+            blocked_hits: int = 0
+            for src_file in sorted(skill_dir.rglob("*")):
+                if not src_file.is_file():
+                    continue
+                try:
+                    content_text = src_file.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    # Truly unreadable file — skip the scan; copy_skill
+                    # will surface the OSError during the actual copy if
+                    # it is real, otherwise the file passes through as
+                    # a binary asset.
+                    continue
+                guard = privacy.enforce_write_guard(
+                    content_text,
+                    surface="cli_context_init",
+                    force_unsafe=force_unsafe_import,
+                    scope=scope,
+                    audit_context={
+                        "source_file": str(src_file),
+                        "skill_name": skill_name,
+                        "kind": "skills",
+                    },
+                    record_outcome=True,
+                )
+                if guard.decision in ("blocked", "blocked_project_shared"):
+                    blocked_file = src_file
+                    blocked_decision = guard.decision
+                    blocked_hits = len(guard.hits)
+                    break
+                if guard.decision not in ("pass", "bypassed"):
+                    raise RuntimeError(
+                        f"enforce_write_guard returned unexpected decision: {guard.decision!r}"
+                    )
+
+            if blocked_file is not None:
+                if scope == "project_shared":
+                    raise click.ClickException(
+                        format_project_shared_block_message(
+                            blocked_file,
+                            hits_count=blocked_hits,
+                            scope=scope,
+                            kind="skill",
+                            imported_so_far=len(imported),
+                        )
+                    )
+                code: skip_codes.SkipCode = (
+                    skip_codes.PRIVACY_BLOCKED_PROJECT_SHARED
+                    if blocked_decision == "blocked_project_shared"
+                    else skip_codes.PRIVACY_BLOCKED
+                )
+                hint = (
+                    " — pass --force-unsafe-import to bypass"
+                    if blocked_decision == "blocked"
+                    else ""
+                )
+                skipped.append(
+                    (
+                        skill_name,
+                        f"blocked: {blocked_file.name} hit {blocked_hits} pattern(s){hint}",
+                        code,
+                    )
+                )
+                seen[skill_name] = runtime_label
+                continue
+
+            # All files clean — copy the whole tree (atomic at directory level).
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            copy_skill(skill_dir, dst)
+            imported.append(dst)
             seen[skill_name] = runtime_label
-            continue
-        copy_skill(detected.path, dst)
-        imported.append(dst)
-        seen[skill_name] = runtime_label
 
     return ExtractResult(imported=imported, skipped=skipped)
 
@@ -343,6 +488,7 @@ def diff_skills(project_root: Path) -> list[tuple[str, str, str]]:
             else:
                 src = canonical_root / name
                 dst = gen.target_dir(project_root, name)
+                assert dst is not None  # ADR-0011 PR-E: default scope=project_shared never None
                 if _skill_dirs_equal(src, dst):
                     results.append((gen_name, name, "in sync"))
                 else:

@@ -17,12 +17,26 @@ from typing import Final, Literal
 NO_CANONICAL_ROOT: Final = "no_canonical_root"
 UNKNOWN_RUNTIME: Final = "unknown_runtime"
 PARSE_ERROR: Final = "parse_error"
+# ADR-0011 PR-E: emitted when ``_runtime_targets.RUNTIME_FANOUT_TABLE`` returns
+# ``None`` for the requested ``(artifact, runtime, scope)`` tuple — i.e. that
+# combination has no fan-out target by design (e.g. ``project_local`` per
+# ADR §3, or ``(commands, codex, project_*)`` since Codex CLI prompts live
+# user-only). Loud emit, not silent — feedback_defensive_noise.md.
+NO_PROJECT_FANOUT_FOR_RUNTIME: Final = "no_project_fanout_for_runtime"
 
 # Import (runtime → canonical) skip codes.
 INVALID_NAME: Final = "invalid_name"
 ALREADY_IMPORTED: Final = "already_imported"
 CANONICAL_EXISTS: Final = "canonical_exists"
 TOML_PARSE_ERROR: Final = "toml_parse_error"
+# ADR-0011 PR-E2: emitted when ``enforce_write_guard`` blocks an import to a
+# user/project_local destination. ``PRIVACY_BLOCKED_PROJECT_SHARED`` is the
+# distinct signal that a force-unsafe bypass was attempted into git-tracked
+# memory and hard-refused (ADR §5). project_shared destinations RAISE
+# ``ClickException`` rather than skipping, so these codes only appear in
+# ``ExtractResult.skipped`` for user / project_local destinations.
+PRIVACY_BLOCKED: Final = "privacy_blocked"
+PRIVACY_BLOCKED_PROJECT_SHARED: Final = "privacy_blocked_project_shared"
 
 # Closed set of skip codes — typing dataclass `skipped` triples and route
 # response builders against `SkipCode` catches typos at the construction site
@@ -31,8 +45,11 @@ SkipCode = Literal[
     "no_canonical_root",
     "unknown_runtime",
     "parse_error",
+    "no_project_fanout_for_runtime",
     "invalid_name",
     "already_imported",
     "canonical_exists",
     "toml_parse_error",
+    "privacy_blocked",
+    "privacy_blocked_project_shared",
 ]
