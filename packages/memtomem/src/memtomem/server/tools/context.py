@@ -1,4 +1,4 @@
-"""Tools: context_detect, context_init, context_generate, context_sync, context_diff."""
+"""Tools: context_detect, context_init, context_generate, context_sync, context_diff, context_migrate."""
 
 from __future__ import annotations
 
@@ -817,3 +817,149 @@ async def mem_context_sync(
                 results.append(f"  {sr.status} {sname}: {sr.reason}")
 
     return "Synced:\n" + "\n".join(results) if results else "Nothing to sync."
+
+
+_KNOWN_MEMORY_SCOPES: frozenset[str] = frozenset({"user", "project_shared", "project_local"})
+
+
+@mcp.tool()
+@tool_handler
+@register("context")
+async def mem_context_migrate(
+    source: str,
+    from_scope: str,
+    to_scope: str,
+    apply_: bool = False,
+    confirm_project_shared: bool = False,
+    ctx: CtxType = None,
+) -> str:
+    """Move markdown memory file(s) between ADR-0011 memory scope tiers.
+
+    Mirrors the CLI ``mm context memory-migrate <SOURCE> --from <scope>
+    --to <scope> [--apply] [--confirm-project-shared]``
+    (``cli/context_cmd.py:2574-2659``). Chunk-id-stable single-DB rename:
+    the source file moves on disk to the target tier's canonical
+    directory and the ``chunks`` table is UPDATEd in place via
+    ``update_chunks_scope_for_source`` so chunk UUIDs and the
+    ``chunk_links`` lineage are preserved. No re-index is triggered.
+
+    Cross-DB migration is out of scope — deferred per ADR-0012 / #911.
+
+    Args:
+        source: Single existing markdown file path OR a glob pattern
+            (e.g. ``"~/.memtomem/memories/**/*.md"``). For globs the
+            pre-flight pass (privacy scan + lockfile probe) runs over
+            every match before any FS move; on per-file DB failure
+            mid-batch, that file's FS move is reverted, the remaining
+            files are left untouched, and the call exits with the
+            partial-progress message in the returned text.
+        from_scope: Source memory tier — ``user``, ``project_shared``,
+            or ``project_local``.
+        to_scope: Target memory tier (same vocabulary). Must differ
+            from ``from_scope``.
+        apply_: Execute the migration. Default ``False`` returns a
+            dry-run preview (the same plan output the CLI shows above
+            its "Run with --apply to execute." footer).
+        confirm_project_shared: Required when ``to_scope="project_shared"``;
+            MCP cannot prompt interactively, so a missing confirmation
+            returns a ``needs confirmation`` message instead of touching
+            disk. Mirrors ``mem_context_init`` / ``mem_context_generate``
+            project_shared gating.
+
+    Privacy: when ``to_scope="project_shared"`` the file content is
+    re-scanned by ``privacy.enforce_write_guard`` both at pre-flight and
+    at apply time (the latter catches in-flight edits during the
+    confirmation window). Secret hits reject the migration with no
+    force bypass — git history is forever (ADR-0011 §5). Rejections
+    surface as ``privacy block: ...`` in the returned text.
+    """
+    from memtomem.cli.context_cmd import (
+        _memory_migrate_run,
+        _resolve_memory_migrate_sources,
+    )
+    from memtomem.context.privacy_scan import PrivacyScanError
+
+    # Scope vocabulary validation up-front so callers get a clean error
+    # instead of a downstream MemoryScopeError stringification.
+    for label, value in (("from_scope", from_scope), ("to_scope", to_scope)):
+        if value not in _KNOWN_MEMORY_SCOPES:
+            return f"error: Unknown {label}='{value}'. Supported: {sorted(_KNOWN_MEMORY_SCOPES)}"
+
+    if from_scope == to_scope:
+        return "error: --from and --to must differ."
+
+    # Gate B: project_shared writes go to the git-tracked memory tier.
+    # MCP has no interactive prompt, so refuse early and tell the caller
+    # how to opt in. Mirrors mem_context_init project_shared gating at
+    # ``tools/context.py:151-155``.
+    if to_scope == "project_shared" and not confirm_project_shared:
+        return (
+            "needs confirmation: to_scope='project_shared' writes to the "
+            "git-tracked memory tier. Re-call with confirm_project_shared=True "
+            "to proceed."
+        )
+
+    try:
+        sources = _resolve_memory_migrate_sources(source)
+    except click.ClickException as exc:
+        return f"error: {exc.message}"
+
+    # Per-call output buffers passed into ``_memory_migrate_run``.
+    # We deliberately do NOT use ``contextlib.redirect_stdout`` /
+    # ``redirect_stderr``: both swap ``sys.stdout`` / ``sys.stderr``
+    # process-globally for the duration of the ``with`` block, and the
+    # block awaits the heavy helper. While this coroutine is suspended
+    # on I/O, any other concurrent MCP tool call that prints (or that
+    # internally ``click.echo``s) would land in our buffer — and our
+    # output would land in theirs. Routing through per-call lists keeps
+    # each call's output strictly local; the helper falls back to its
+    # original ``click.secho`` behaviour when both buffers are ``None``
+    # (CLI path). Codex review-pass on PR #926.
+    stdout_lines: list[str] = []
+    stderr_lines: list[str] = []
+    try:
+        await _memory_migrate_run(
+            sources,
+            from_scope,
+            to_scope,
+            apply_,
+            # ``yes=True`` because the MCP wrapper has already gated
+            # Gate B above via the explicit ``confirm_project_shared``
+            # argument. ``yes`` only suppresses the ``click.confirm``
+            # prompt that the CLI falls through to when
+            # ``confirm_project_shared`` is missing — irrelevant for
+            # MCP, which has no TTY.
+            yes=True,
+            confirm_project_shared=confirm_project_shared,
+            stdout_buf=stdout_lines,
+            stderr_buf=stderr_lines,
+        )
+    except PrivacyScanError as exc:
+        return f"privacy block: {exc.message}"
+    except click.exceptions.Exit:
+        # Gate A privacy block — the helper recorded the rejection text
+        # in ``stderr_lines`` before exiting. Surface as a privacy
+        # block so the MCP caller can branch on the prefix.
+        stderr_text = "\n".join(stderr_lines).strip()
+        if "Gate A:" in stderr_text:
+            return f"privacy block: {stderr_text}"
+        return f"error: {stderr_text or 'migration exited unexpectedly'}"
+    except click.ClickException as exc:
+        # Mid-batch failures (DB UPDATE failed, double-failure path)
+        # record per-file partial-progress lines in ``stderr_lines``
+        # BEFORE raising ``ClickException``. Append those so the MCP
+        # caller sees the K-of-N batch state, not just the bare error
+        # message — Codex flagged this on PR #926.
+        stderr_tail = "\n".join(stderr_lines).strip()
+        if stderr_tail:
+            return f"error: {exc.message}\n{stderr_tail}"
+        return f"error: {exc.message}"
+
+    stdout_text = "\n".join(stdout_lines).rstrip()
+    # Helper paths that reach here without raising have nothing in
+    # ``stderr_lines`` today; defensively concatenate so a future
+    # warning-but-don't-raise path is not silently dropped.
+    stderr_tail = "\n".join(stderr_lines).strip()
+    if stderr_tail:
+        stdout_text = f"{stdout_text}\n{stderr_tail}" if stdout_text else stderr_tail
+    return stdout_text or "Nothing to migrate."
