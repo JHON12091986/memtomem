@@ -61,7 +61,6 @@ from memtomem.web.schemas.config import (
     EmbeddingResetResponse,
     EmbeddingStatusResponse,
     ModelComponent,
-    ModelComponentState,
     ModelReadinessResponse,
     PrivacyPatternEntry,
     PrivacyPatternsResponse,
@@ -850,10 +849,14 @@ def _component_for(
     loading = bool(getattr(holder, "_loading", False))
     load_error = getattr(holder, "_load_error", None)
 
-    if load_error:
-        state: ModelComponentState = "error"
-    elif loaded:
+    if loaded:
+        # A lazy loader can keep a stale ``_load_error`` from an earlier
+        # failed attempt even after a later search successfully constructs
+        # the model. Loaded-in-memory is the authoritative terminal state.
         state = "ready"
+        load_error = None
+    elif load_error:
+        state = "error"
     elif loading:
         state = "downloading" if not cache_present else "loading"
     else:
