@@ -374,8 +374,12 @@ class TestNoHardcodedStrings:
             "home.health.unknown",
             "home.pin.unpin_title",
         }
-        assert not (required - set(en)), f"#990 keys missing from en.json: {sorted(required - set(en))}"
-        assert not (required - set(ko)), f"#990 keys missing from ko.json: {sorted(required - set(ko))}"
+        assert not (required - set(en)), (
+            f"#990 keys missing from en.json: {sorted(required - set(en))}"
+        )
+        assert not (required - set(ko)), (
+            f"#990 keys missing from ko.json: {sorted(required - set(ko))}"
+        )
 
         app = (_STATIC_JS_DIR / "app.js").read_text(encoding="utf-8")
         home_start = app.index("// Home Dashboard (D3)")
