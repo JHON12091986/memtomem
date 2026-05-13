@@ -13,6 +13,7 @@ on the read side at ``memtomem.indexing.engine.memory_dir_stats``.
 from __future__ import annotations
 
 import asyncio as _asyncio
+import inspect
 import json
 import logging
 import os
@@ -26,12 +27,14 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from memtomem.config import (
     FIELD_CONSTRAINTS,
     MUTABLE_FIELDS,
+    RerankConfig,
     classify_scope,
     build_comparand,
     coerce_and_validate,
     memory_dir_kind,
     save_config_overrides,
 )
+from memtomem.search.reranker.factory import create_reranker
 from memtomem.storage.sqlite_helpers import norm_path
 from memtomem.tools.memory_writer import append_entry
 from memtomem.web import hot_reload as _hot_reload
@@ -54,6 +57,7 @@ from memtomem.web.schemas.config import (
     ConfigPatchChange,
     ConfigPatchRequest,
     ConfigPatchResponse,
+    ConfigRerankOut,
     ConfigResponse,
     ConfigSearchOut,
     ConfigStorageOut,
@@ -113,6 +117,40 @@ def _require_localhost(request: Request) -> None:
     client = request.client
     if client and client.host not in _LOCALHOST_ADDRS:
         raise HTTPException(status_code=403, detail="This endpoint is restricted to localhost")
+
+
+async def _validate_reranker_ready(reranker: object | None) -> None:
+    """Force lazy local rerankers to load before enabling them at runtime.
+
+    Reaches into the reranker's private ``_get_model`` to drive the lazy
+    load eagerly, so a missing dependency (e.g. ``fastembed`` not
+    installed) surfaces as a clean rejection rather than a 500 at first
+    search.
+    """
+    if reranker is None:
+        return
+
+    load_model = getattr(reranker, "_get_model", None)
+    if callable(load_model):
+        await _asyncio.to_thread(load_model)
+
+
+async def _close_reranker_safely(reranker: object) -> None:
+    """Close a reranker, tolerating sync/async/missing close + errors.
+
+    The route holds ``_config_lock`` across this, so swallowing close-time
+    exceptions keeps a clean "rejected"/"accepted" reply from turning
+    into a 500 when the old/new instance has a flaky teardown.
+    """
+    close = getattr(reranker, "close", None)
+    if not callable(close):
+        return
+    try:
+        result = close()
+        if inspect.isawaitable(result):
+            await result
+    except Exception:
+        logger.exception("Error while closing reranker")
 
 
 router = APIRouter(tags=["system"])
@@ -253,6 +291,14 @@ def _build_config_response(
             enabled=cfg.mmr.enabled,
             lambda_param=cfg.mmr.lambda_param,
         ),
+        rerank=ConfigRerankOut(
+            enabled=cfg.rerank.enabled,
+            provider=cfg.rerank.provider,
+            model=cfg.rerank.model,
+            oversample=cfg.rerank.oversample,
+            min_pool=cfg.rerank.min_pool,
+            max_pool=cfg.rerank.max_pool,
+        ),
         namespace=ConfigNamespaceOut(
             default_namespace=cfg.namespace.default_namespace,
             enable_auto_ns=cfg.namespace.enable_auto_ns,
@@ -348,6 +394,17 @@ async def get_privacy_patterns() -> PrivacyPatternsResponse:
 # from memtomem.config (canonical single source of truth).
 
 
+_RERANK_PATCH_FIELDS = (
+    "enabled",
+    "provider",
+    "model",
+    "api_key",
+    "oversample",
+    "min_pool",
+    "max_pool",
+)
+
+
 @router.patch("/config", response_model=ConfigPatchResponse)
 async def patch_config(
     req: ConfigPatchRequest,
@@ -360,6 +417,7 @@ async def patch_config(
     applied: list[ConfigPatchChange] = []
     rejected: list[str] = []
     tokenizer_changed = False
+    rerank_changed = False
 
     try:
         async with _asyncio.timeout(60):
@@ -378,6 +436,72 @@ async def patch_config(
                     section_obj = getattr(config, section_name, None)
                     if section_obj is None:
                         rejected.append(f"{section_name}: unknown section")
+                        continue
+
+                    if section_name == "rerank":
+                        candidate_values: dict[str, object] = {}
+                        pending_changes: list[tuple[str, object, object]] = []
+
+                        for key, value in updates.items():
+                            full_key = f"{section_name}.{key}"
+                            if key not in allowed:
+                                rejected.append(f"{full_key}: read-only field")
+                                continue
+
+                            constraint = FIELD_CONSTRAINTS.get(full_key)
+                            try:
+                                coerced = coerce_and_validate(value, constraint)
+                            except ValueError as e:
+                                rejected.append(f"{full_key}: {e}")
+                                continue
+
+                            old_val = getattr(section_obj, key)
+                            candidate_values[key] = coerced
+                            pending_changes.append((key, old_val, coerced))
+
+                        if not pending_changes:
+                            continue
+
+                        candidate_data = {
+                            key: getattr(section_obj, key)
+                            for key in _RERANK_PATCH_FIELDS
+                            if hasattr(section_obj, key)
+                        }
+                        candidate_data.update(candidate_values)
+                        try:
+                            candidate_rerank = RerankConfig(**candidate_data)
+                        except ValueError as e:
+                            rejected.append(f"rerank: {e}")
+                            continue
+
+                        new_reranker = None
+                        try:
+                            new_reranker = create_reranker(candidate_rerank)
+                            await _validate_reranker_ready(new_reranker)
+                        except Exception as e:
+                            if new_reranker is not None:
+                                await _close_reranker_safely(new_reranker)
+                            rejected.append(f"rerank.enabled: {e}")
+                            continue
+
+                        old_reranker = getattr(search_pipeline, "_reranker", None)
+                        if old_reranker is not None and old_reranker is not new_reranker:
+                            await _close_reranker_safely(old_reranker)
+                        search_pipeline._reranker = new_reranker
+                        search_pipeline._rerank_config = (
+                            candidate_rerank if candidate_rerank.enabled else None
+                        )
+                        config.rerank = candidate_rerank
+                        rerank_changed = True
+
+                        for key, old_val, coerced in pending_changes:
+                            applied.append(
+                                ConfigPatchChange(
+                                    field=f"{section_name}.{key}",
+                                    old_value=str(old_val),
+                                    new_value=str(coerced),
+                                )
+                            )
                         continue
 
                     for key, value in updates.items():
@@ -406,9 +530,13 @@ async def patch_config(
                         )
 
                 # Runtime fanout: tokenizer FTS rebuild + cache invalidation.
-                # Shared with the reload path via
-                # ``apply_runtime_config_changes`` so a disk-triggered change
-                # fires the same side-effects as an in-process PATCH.
+                # Tokenizer fanout is shared with the disk-reload path via
+                # ``apply_runtime_config_changes``. Reranker sync is handled
+                # inline above (before this point) instead of via the helper
+                # because the route runs in an async context and can
+                # ``await`` validation + close; the helper's sync path uses
+                # fire-and-forget close. Keep the two paths in lockstep when
+                # changing either.
                 if tokenizer_changed:
                     from memtomem.storage.fts_tokenizer import set_tokenizer
 
@@ -420,7 +548,7 @@ async def patch_config(
                         count,
                     )
 
-                if applied:
+                if applied or rerank_changed:
                     search_pipeline.invalidate_cache()
 
                 if persist:

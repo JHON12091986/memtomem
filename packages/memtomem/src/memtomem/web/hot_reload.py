@@ -286,6 +286,8 @@ def apply_runtime_config_changes(
 
     * ``search.tokenizer`` changed → re-register global tokenizer + schedule
       ``storage.rebuild_fts()`` (async, fire-and-forget on current loop).
+    * ``rerank`` changed → rebuild the live reranker attached to the search
+      pipeline.
     * Any change → invalidate search cache.
 
     Older callers of this helper (e.g. the PATCH handler) may not provide
@@ -311,7 +313,104 @@ def apply_runtime_config_changes(
         _schedule_fts_rebuild(storage, new_cfg.search.tokenizer, app=app)
 
     if search_pipeline is not None:
+        _sync_reranker(old_cfg, new_cfg, search_pipeline)
         search_pipeline.invalidate_cache()
+
+
+def _sync_reranker(old_cfg: Any, new_cfg: Any, search_pipeline: SearchPipeline) -> None:
+    old_snapshot = _rerank_snapshot(old_cfg)
+    new_snapshot = _rerank_snapshot(new_cfg)
+    if new_snapshot is None or old_snapshot == new_snapshot:
+        return
+
+    from memtomem.search.reranker.factory import create_reranker
+
+    try:
+        new_reranker = create_reranker(new_cfg.rerank)
+    except Exception:
+        # Disk-edit path is best-effort: a broken factory call leaves the
+        # previous reranker in place so the live pipeline keeps working.
+        # The PATCH path surfaces the same failure as a 200/rejected reply
+        # before mutating any state.
+        logger.exception("Failed to build reranker from hot-reloaded config; keeping previous")
+        return
+
+    # Mirror the PATCH path's eager lazy-load check so a disk edit that
+    # enables rerank against a missing dep (e.g. fastembed) fails here
+    # instead of at first search.
+    if new_reranker is not None:
+        load_model = getattr(new_reranker, "_get_model", None)
+        if callable(load_model):
+            try:
+                load_model()
+            except Exception:
+                logger.exception("Hot-reloaded reranker failed to load; keeping previous instance")
+                _close_async_component(new_reranker)
+                return
+
+    old_reranker = getattr(search_pipeline, "_reranker", None)
+    search_pipeline._reranker = new_reranker
+    search_pipeline._rerank_config = new_cfg.rerank if new_cfg.rerank.enabled else None
+
+    if old_reranker is not None and old_reranker is not new_reranker:
+        _close_async_component(old_reranker)
+
+
+def _rerank_snapshot(cfg: Any) -> tuple[object, ...] | None:
+    rerank = getattr(cfg, "rerank", None)
+    enabled = getattr(rerank, "enabled", None)
+    if not isinstance(enabled, bool):
+        return None
+    return (
+        enabled,
+        getattr(rerank, "provider", None),
+        getattr(rerank, "model", None),
+        getattr(rerank, "api_key", None),
+        getattr(rerank, "oversample", None),
+        getattr(rerank, "min_pool", None),
+        getattr(rerank, "max_pool", None),
+    )
+
+
+def _close_async_component(component: object) -> None:
+    close = getattr(component, "close", None)
+    if not callable(close):
+        return
+
+    result = close()
+    if result is None:
+        return
+
+    import asyncio
+    import inspect
+
+    # Narrow to ``Coroutine`` (not just ``Awaitable``) because that's what
+    # ``asyncio.run`` / ``loop.create_task`` accept. In practice every
+    # reranker ``close()`` we wrap is ``async def`` so returns a coroutine.
+    if not inspect.iscoroutine(result):
+        return
+
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        try:
+            asyncio.run(result)
+        except Exception:
+            logger.exception("Error while closing replaced reranker")
+        return
+
+    task: asyncio.Task[Any] = loop.create_task(result)
+    task.add_done_callback(_log_close_task_exception)
+
+
+def _log_close_task_exception(task: Any) -> None:
+    # Fire-and-forget close tasks must not leak "Task exception was never
+    # retrieved" warnings — surface the failure with a useful stack instead.
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Error while closing replaced reranker", exc_info=exc)
 
 
 def _schedule_fts_rebuild(
