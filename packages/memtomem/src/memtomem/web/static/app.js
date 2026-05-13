@@ -1520,9 +1520,8 @@ async function loadDashboard() {
     // /api/sessions and /api/scratch are dev-only — gated below. The
     // namespaces list endpoint is prod-mounted via namespaces_read so
     // the donut + count card render real values in both tiers.
-    const [stats, sourcesData, nsData, configData, embStatus, timelineData, memDirsResp] = await Promise.all([
+    const [stats, nsData, configData, embStatus, timelineData, memDirsResp] = await Promise.all([
       api('GET', '/api/stats'),
-      api('GET', '/api/sources'),
       api('GET', '/api/namespaces').catch(() => ({ namespaces: [] })),
       api('GET', '/api/config'),
       api('GET', '/api/embedding-status').catch(() => null),
@@ -1530,23 +1529,16 @@ async function loadDashboard() {
       api('GET', '/api/memory-dirs/status').catch(() => ({ dirs: [] })),
     ]);
 
-    const allSources = sourcesData.sources || [];
+    const allSources = Array.isArray(stats.home_sources) ? stats.home_sources : [];
+    const sourceTypeCounts = Array.isArray(stats.home_file_type_distribution)
+      ? stats.home_file_type_distribution
+      : null;
     const namespaces = nsData.namespaces || [];
 
     // Mirror onto STATE so a Home → recent-source click can resolve
-    // the target vendor sub-tab before activating the Sources tab —
-    // otherwise ``_navigateToSource`` falls through to a stale
-    // localStorage vendor on the cold-load path. ``loadSources`` will
-    // overwrite both fields with a fresh fetch (``?limit=10000``) when
-    // the Sources tab is actually opened, so the dashboard's snapshot
-    // is just a fast path, never a source of truth — the
-    // ``/api/sources`` call here uses the server's default limit, so
-    // on instances with more sources than that default the mirror is
-    // a partial set. Eager resolve in ``_navigateToSource`` will miss
-    // the unseen tail and fall through to the cold-load branch in
-    // ``_renderMemorySourceTree``, which re-resolves vendor against
-    // the post-``loadSources`` STATE — so partiality stays a perf
-    // hint, not a correctness issue.
+    // the target vendor sub-tab before activating the Sources tab.
+    // The dashboard now uses backend aggregates for complete counts and
+    // distributions, so this snapshot reflects all visible sources.
     STATE.allSources = allSources;
     const _memStatusByPath = {};
     for (const entry of (memDirsResp && memDirsResp.dirs) || []) {
@@ -1555,10 +1547,14 @@ async function loadDashboard() {
     STATE.memoryStatusByPath = _memStatusByPath;
 
     // A. Stats cards
-    qs('home-chunks').textContent = stats.total_chunks.toLocaleString();
-    qs('home-sources').textContent = stats.total_sources.toLocaleString();
+    qs('home-chunks').textContent = Number(stats.total_chunks || 0).toLocaleString();
+    qs('home-sources').textContent = Number(allSources.length || stats.total_sources || 0).toLocaleString();
     qs('home-namespaces').textContent = namespaces.length;
-    const totalSize = allSources.reduce((sum, s) => sum + (s.file_size || 0), 0);
+    const totalSize = Number(
+      typeof stats.home_total_source_size === 'number'
+        ? stats.home_total_source_size
+        : allSources.reduce((sum, s) => sum + (s.file_size || 0), 0)
+    );
     qs('home-total-size').textContent = formatBytes(totalSize) || '0 B';
 
     // Harness stats (sessions + scratch) — dev-only routers. In prod we
@@ -1580,7 +1576,7 @@ async function loadDashboard() {
     _renderActivityMap(timelineData.chunks || []);
 
     // D. File Type Distribution
-    _renderFileTypeChart(allSources);
+    _renderFileTypeChart(allSources, sourceTypeCounts);
 
     // G. Namespace Summary
     _renderNsChart(namespaces);
@@ -1729,13 +1725,23 @@ function _jumpToTimelineDate(dateKey) {
 }
 
 // D. File Type Distribution
-function _renderFileTypeChart(sources) {
+function _renderFileTypeChart(sources, distribution = null) {
   const chart = qs('home-type-chart');
   const typeCounts = {};
-  sources.forEach(s => {
-    const ext = (s.path.split('.').pop() || 'other').toLowerCase();
-    typeCounts[ext] = (typeCounts[ext] || 0) + 1;
-  });
+  if (Array.isArray(distribution) && distribution.length) {
+    distribution.forEach(item => {
+      const ext = typeof item?.file_type === 'string' ? item.file_type : '';
+      const count = Number(item?.count);
+      if (ext) {
+        typeCounts[ext.toLowerCase()] = (typeCounts[ext.toLowerCase()] || 0) + (Number.isFinite(count) ? count : 0);
+      }
+    });
+  } else {
+    sources.forEach(s => {
+      const ext = (s.path.split('.').pop() || 'other').toLowerCase();
+      typeCounts[ext] = (typeCounts[ext] || 0) + 1;
+    });
+  }
 
   const sorted = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).slice(0, 6);
   const max = sorted[0]?.[1] || 1;
