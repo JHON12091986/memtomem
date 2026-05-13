@@ -137,18 +137,20 @@ function _ctxTargetScopeParam() {
   return `target_scope=${encodeURIComponent(_ctxTargetScope)}`;
 }
 
-function _ctxScopeParam() {
-  if (!_ctxActiveScopeId) return '';
+function _ctxScopeParam(scopeId = _ctxActiveScopeId) {
+  if (!scopeId) return '';
   const activeScope = (_ctxProjectsCache || []).find(scope =>
-    scope && scope.scope_id === _ctxActiveScopeId && !scope.missing);
+    scope && scope.scope_id === scopeId && !scope.missing);
   if (!activeScope) return '';
-  return `scope_id=${encodeURIComponent(_ctxActiveScopeId)}`;
+  return `scope_id=${encodeURIComponent(scopeId)}`;
 }
 
 function _ctxWithTargetScope(url, opts = {}) {
   const params = [];
   const targetParam = _ctxTargetScopeParam();
-  const scopeParam = opts.includeScope === false ? '' : _ctxScopeParam();
+  const scopeParam = opts.includeScope === false
+    ? ''
+    : _ctxScopeParam(opts.scopeId);
   if (targetParam) params.push(targetParam);
   if (scopeParam) params.push(scopeParam);
   if (!params.length) return url;
@@ -1069,6 +1071,7 @@ document.getElementById('ctx-sync-all-btn')?.addEventListener('click', async () 
   if (!ok) return;
   btnLoading(btn, true);
   try {
+    const syncAllScopeId = _ctxActiveScopeId;
     const csrf = await ensureCsrfToken();
     const headers = csrf
       ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
@@ -1082,7 +1085,7 @@ document.getElementById('ctx-sync-all-btn')?.addEventListener('click', async () 
       : ['skills', 'agents'];
     for (const typ of types) {
       const resp = await fetch(
-        _ctxWithTargetScope(`/api/context/${typ}/sync`),
+        _ctxWithTargetScope(`/api/context/${typ}/sync`, { scopeId: syncAllScopeId }),
         { method: 'POST', headers },
       );
       if (!resp.ok) {
@@ -1109,7 +1112,7 @@ document.getElementById('ctx-sync-all-btn')?.addEventListener('click', async () 
     //   needs_confirmation → info partial + Open Settings action (#774)
     //   all ok / skipped   → sync_success
     const settingsResp = await fetch(
-      _ctxWithTargetScope('/api/context/settings/sync'),
+      _ctxWithTargetScope('/api/context/settings/sync', { scopeId: syncAllScopeId }),
       { method: 'POST', headers },
     );
     if (!settingsResp.ok) {
