@@ -137,6 +137,17 @@ def test_embedder_error_when_load_error_set(fake_cache_absent):
     assert body["embedder"]["error"] == "boom"
 
 
+def test_embedder_ready_wins_over_stale_load_error(fake_cache_present):
+    """A later successful load must clear an earlier failed-attempt banner."""
+    embedder = _StubLoader(_model=object(), _load_error="stale failure")
+    app = _make_app(_config(), embedder, reranker=None)
+    with TestClient(app) as c:
+        resp = c.get("/api/system/model-readiness")
+    body = resp.json()
+    assert body["embedder"]["state"] == "ready"
+    assert body["embedder"]["error"] is None
+
+
 def test_embedder_skipped_when_provider_not_onnx(fake_cache_absent):
     """Ollama/Cohere providers have their own connection model — skip."""
     app = _make_app(_config(embedder_provider="ollama"), _StubLoader(), reranker=None)
@@ -184,3 +195,17 @@ def test_reranker_states_when_enabled(fake_cache_present):
     assert body["reranker"]["state"] == "loading"
     # 1110 MB matches fastembed's reported size_in_GB for jina-reranker-v2.
     assert body["reranker"]["approx_size_mb"] == 1110
+
+
+def test_reranker_ready_wins_over_stale_load_error(fake_cache_present):
+    reranker = _StubLoader(_model=object(), _load_error="stale failure")
+    app = _make_app(
+        _config(rerank_enabled=True),
+        _StubLoader(_model=object()),
+        reranker=reranker,
+    )
+    with TestClient(app) as c:
+        resp = c.get("/api/system/model-readiness")
+    body = resp.json()
+    assert body["reranker"]["state"] == "ready"
+    assert body["reranker"]["error"] is None
