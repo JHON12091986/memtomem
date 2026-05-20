@@ -485,8 +485,14 @@ def _configure_network_transport(args, transport: str) -> tuple[str, str | None]
         mcp.settings.streamable_http_path = endpoint_path
 
     if args.disable_dns_rebinding_protection:
+        # Pin the allow-lists to empty even though the SDK's current default
+        # is `[]` — relying on that default means a future upstream change
+        # could silently widen what we accept when DNS rebinding protection
+        # is off. Pass them explicitly so the contract here is local.
         mcp.settings.transport_security = TransportSecuritySettings(
-            enable_dns_rebinding_protection=False
+            enable_dns_rebinding_protection=False,
+            allowed_hosts=[],
+            allowed_origins=[],
         )
         return public_url, mount_path
 
@@ -523,21 +529,50 @@ def _print_network_server_info(
 ) -> None:
     transport_label = "http (streamable-http)" if args.transport == "http" else transport
     internal_url = _internal_network_url(args, transport, mount_path)
-    print(
-        "\n".join(
+    lines = [
+        "memtomem-server",
+        f"Transport: {transport_label}",
+        f"Internal URL: {internal_url}",
+        f"Public URL:   {public_url}",
+        "",
+        "Reverse proxy note:",
+        "  Forward the public URL path unchanged to the internal URL path.",
+    ]
+    # ``--host 0.0.0.0`` binds on every interface but ``_host_patterns``
+    # returns ``[]`` for the wildcard, so the DNS-rebinding allow-list only
+    # contains loopback unless ``--url`` carries a non-loopback hostname.
+    # The hint recommends only ``--url`` because the MCP SDK does exact
+    # ``Host`` matching unless an allow-list entry ends in ``:*`` (see
+    # ``mcp/server/transport_security.py``); ``--url`` derives both the
+    # ``:*`` wildcard *and* the matching ``Origin`` automatically, while
+    # a bare ``--allowed-host <reachable-host>`` does not match the
+    # typical ``Host: <reachable-host>:<port>`` header and still leaves
+    # Origin-bearing clients blocked.
+    #
+    # Only emit the hint when the user has not signalled they intend an
+    # advanced configuration. ``--disable-dns-rebinding-protection``
+    # skips Host/Origin checks entirely; explicit ``--allowed-host`` or
+    # ``--allowed-origin`` values mean the user has already authorized
+    # additional headers. In those cases the "only loopback ... accepted"
+    # message is wrong, so suppress it rather than mislead.
+    hint_applies = (
+        args.host in {"0.0.0.0", "::"}
+        and args.url is None
+        and not args.disable_dns_rebinding_protection
+        and not args.allowed_host
+        and not args.allowed_origin
+    )
+    if hint_applies:
+        lines.extend(
             [
-                "memtomem-server",
-                f"Transport: {transport_label}",
-                f"Internal URL: {internal_url}",
-                f"Public URL:   {public_url}",
                 "",
-                "Reverse proxy note:",
-                "  Forward the public URL path unchanged to the internal URL path.",
-                "",
-                "Press Ctrl+C to stop.",
+                f"Note: bound on {args.host} but only loopback Host/Origin headers are",
+                "      accepted. Pass --url http://<reachable-host>:<port>/... for",
+                "      LAN clients (auto-populates the Host and Origin allow-lists).",
             ]
         )
-    )
+    lines.extend(["", "Press Ctrl+C to stop."])
+    print("\n".join(lines))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -556,9 +591,14 @@ def main(argv: list[str] | None = None) -> None:
         _print_direct_stdio_help()
         raise SystemExit(2)
     if transport != "stdio":
+        # Configure ``mcp.settings`` up front so it's ready by ``mcp.run()``,
+        # but defer the user-facing banner until after the pid-lock decision:
+        # printing "Press Ctrl+C to stop" before discovering the lock is held
+        # contradicts the "another instance is already running" warning that
+        # the lock-contention branch logs a moment later.
         public_url, mount_path = _configure_network_transport(args, transport)
-        _print_network_server_info(transport, args, public_url, mount_path)
     else:
+        public_url = None
         mount_path = None
 
     # B1: bidirectional mutual exclusion during the transition window.
@@ -676,6 +716,12 @@ def main(argv: list[str] | None = None) -> None:
         if _legacy_lock_fp is not None:
             sigterm_targets.append(legacy_pid_file)
         _install_sigterm_handler(*sigterm_targets)
+
+    if transport != "stdio":
+        # Banner runs after the lock decision so the warning log (if any)
+        # and the "Press Ctrl+C to stop" line stay consistent with reality.
+        assert public_url is not None  # narrowed by the configure branch above
+        _print_network_server_info(transport, args, public_url, mount_path)
 
     if transport == "stdio":
         mcp.run()
