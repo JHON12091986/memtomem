@@ -48,11 +48,12 @@ import hashlib
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
-from memtomem.context._atomic import atomic_write_text
+from memtomem.context._atomic import _file_lock, _lock_path_for, atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +61,19 @@ CANONICAL_SETTINGS_FILE = ".memtomem/settings.json"
 
 # Sentinel for malformed JSON detection (identity-compared via ``is``)
 _MALFORMED = object()
+
+# Whole-call budget for sidecar-lock acquisition across ALL targets (#1145
+# review). The web handler offloads ``generate_all_settings`` to a worker
+# thread under a 60s ``asyncio.timeout``; an unbounded ``portalocker`` wait
+# there would leave an un-cancellable thread writing after the handler already
+# returned 503. This budget is shared across the per-target locks (claude /
+# codex / gemini), NOT per target — a single deadline is computed once and each
+# target waits only the remaining time — so the total wait can never approach
+# ``N_targets × bound`` and stays comfortably under the handler's 60s no matter
+# how many runtimes are registered. On exhaustion a target self-aborts
+# (status="aborted"). The CLI path inherits the same budget, strictly better
+# than hanging.
+_SETTINGS_LOCK_BUDGET_S = 30.0
 
 
 def resolve_scope_path(project_root: Path, scope: str) -> Path:
@@ -886,6 +900,14 @@ def generate_all_settings(
     """
     results: dict[str, SettingsSyncResult] = {}
 
+    # One shared deadline for ALL per-target sidecar-lock waits, so the whole
+    # call — not each target — is bounded by ``_SETTINGS_LOCK_BUDGET_S``. With
+    # N runtimes a per-target bound would let the cumulative wait reach
+    # ``N × bound`` and overrun the web handler's 60s ``asyncio.timeout``,
+    # re-opening the orphaned-worker window (#1145 review). Each target waits
+    # only the time left on this budget.
+    lock_deadline = time.monotonic() + _SETTINGS_LOCK_BUDGET_S
+
     for name, gen in SETTINGS_GENERATORS.items():
         if not gen.is_available(project_root):
             results[name] = SettingsSyncResult(
@@ -929,38 +951,67 @@ def generate_all_settings(
             )
             continue
 
-        # Step 1: read existing + capture mtime (ns)
-        existing_raw, existing_mtime_ns = _read_with_mtime(target_path)
-        if existing_raw is _MALFORMED:
-            results[name] = SettingsSyncResult(
-                status="error",
-                reason=f"{target_path} is not valid JSON. "
-                f"Fix the file manually, then re-run "
-                f"`mm context sync --include=settings`.",
-            )
-            continue
-        existing: dict | None = existing_raw  # type: ignore[assignment]
+        # Steps 1-4 run under a per-target cross-process lock so a separate
+        # process (a CLI ``mm context sync`` / the MCP server) or the Web UI
+        # cannot land a write between the mtime recheck (Step 3) and the atomic
+        # rename inside ``_write_json`` (Step 4) and silently drop a concurrent
+        # writer's hook rule (issue #1123 B3-3). This is the same sidecar-file
+        # ``portalocker`` primitive skills uses; ``_write_json`` →
+        # ``atomic_write_text`` is itself lock-free, so calling it under the held
+        # lock does not self-deadlock. Exactly one lock is held per iteration and
+        # released before the next target, so there is no cross-generator
+        # lock-ordering cycle. The ``st_mtime_ns`` recheck is KEPT as a second
+        # layer: it still catches a non-gateway direct disk edit that bypasses
+        # the sidecar lock entirely.
+        try:
+            # Wait only the time left on the shared budget (not a fresh bound
+            # per target). A 0.0 here means the budget is spent → one
+            # non-blocking attempt: acquire iff instantly free, else abort.
+            lock_timeout = max(0.0, lock_deadline - time.monotonic())
+            with _file_lock(_lock_path_for(target_path), timeout=lock_timeout):
+                # Step 1: read existing + capture mtime (ns)
+                existing_raw, existing_mtime_ns = _read_with_mtime(target_path)
+                if existing_raw is _MALFORMED:
+                    results[name] = SettingsSyncResult(
+                        status="error",
+                        reason=f"{target_path} is not valid JSON. "
+                        f"Fix the file manually, then re-run "
+                        f"`mm context sync --include=settings`.",
+                    )
+                    continue
+                existing: dict | None = existing_raw  # type: ignore[assignment]
 
-        # Step 2: merge in memory
-        merged, warnings = gen.merge(existing, contributions)
+                # Step 2: merge in memory
+                merged, warnings = gen.merge(existing, contributions)
 
-        # Step 3: mtime check (concurrent-write guard)
-        if target_path.is_file() and target_path.stat().st_mtime_ns != existing_mtime_ns:
+                # Step 3: mtime check (concurrent-write guard)
+                if target_path.is_file() and target_path.stat().st_mtime_ns != existing_mtime_ns:
+                    results[name] = SettingsSyncResult(
+                        status="aborted",
+                        reason=f"{target_path} was modified by another "
+                        f"process during merge. Re-run "
+                        f"`mm context sync --include=settings` to retry.",
+                    )
+                    continue
+
+                # Step 4: write
+                _write_json(target_path, merged)
+                results[name] = SettingsSyncResult(
+                    status="ok",
+                    warnings=warnings,
+                    target=target_path,
+                )
+        except TimeoutError:
+            # Another process held the lock past the shared budget. Abort this
+            # target cleanly so the (possibly thread-offloaded) caller never
+            # blocks indefinitely and never orphans a late writer (#1145 review).
             results[name] = SettingsSyncResult(
                 status="aborted",
-                reason=f"{target_path} was modified by another "
-                f"process during merge. Re-run "
+                reason=f"{target_path}: another process held the lock past the "
+                f"{_SETTINGS_LOCK_BUDGET_S:g}s acquisition budget. Re-run "
                 f"`mm context sync --include=settings` to retry.",
             )
             continue
-
-        # Step 4: write
-        _write_json(target_path, merged)
-        results[name] = SettingsSyncResult(
-            status="ok",
-            warnings=warnings,
-            target=target_path,
-        )
 
     return results
 

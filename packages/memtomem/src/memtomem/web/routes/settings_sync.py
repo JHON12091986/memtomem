@@ -411,7 +411,21 @@ async def apply_settings_sync(
     try:
         async with asyncio.timeout(60):
             async with _gateway_lock:
-                results = generate_all_settings(
+                # ``generate_all_settings`` takes a per-target ``portalocker``
+                # lock (#1123 B3-3). Run it in a worker thread: a cross-process
+                # holder of ``.settings.json.lock`` would otherwise block this
+                # synchronous call ON the event loop thread, stalling every
+                # request AND preventing the enclosing ``asyncio.timeout(60)``
+                # from firing (its callback is scheduled on the blocked loop).
+                # The lock waits share a single whole-call budget
+                # (``_SETTINGS_LOCK_BUDGET_S`` < 60s, across all runtime targets,
+                # not per target), so the worker self-aborts with an ``aborted``
+                # status rather than running past the timeout —
+                # ``asyncio.to_thread`` cannot cancel a thread, so without the
+                # budget a timed-out request would orphan a thread that writes
+                # after the 503 (#1145 review).
+                results = await asyncio.to_thread(
+                    generate_all_settings,
                     project_root,
                     scope=target_scope,
                     allow_host_writes=allow_host_writes,
