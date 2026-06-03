@@ -265,11 +265,16 @@ async function _ctxFetchProjectsData(opts = {}) {
   //     same "endpoint exists but failing" class, surface a toast (#1100).
   let warn = null;
   try {
-    // ``?include=counts`` is opt-in server-side (ADR-0021 PR2): the scope
-    // picker renders a per-scope count badge, so this shared loader must
-    // request counts. ``_ctxWithTargetScope`` appends ``&target_scope=`` after
-    // the existing ``?``.
-    const res = await fetch(_ctxWithTargetScope('/api/context/projects?include=counts', { includeScope: false, targetScope: opts.targetScope }));
+    // ``include`` tokens are opt-in server-side (ADR-0021 PR2). ``counts`` is
+    // always requested — every caller renders the scope picker's per-scope
+    // count badges. ``runtime_coverage`` is requested ONLY when the caller asks
+    // (``opts.includeCoverage``): it costs a ``probe_all_runtimes`` pass (per-
+    // client config reads) per scope and is consumed solely by the overview's
+    // Project Scope Matrix, so cheap callers (the per-type list tabs, the
+    // portal, hooks-sync) must NOT pay it on every reload. ``_ctxWithTargetScope``
+    // appends ``&target_scope=`` after the existing ``?``.
+    const include = opts.includeCoverage ? 'counts,runtime_coverage' : 'counts';
+    const res = await fetch(_ctxWithTargetScope(`/api/context/projects?include=${include}`, { includeScope: false, targetScope: opts.targetScope }));
     if (!res.ok) {
       const detail = (await res.json().catch(() => ({}))).detail || `HTTP ${res.status}`;
       if (res.status !== 404) warn = { kind: 'http', status: res.status, detail };
@@ -1085,7 +1090,12 @@ async function loadCtxOverview() {
     // superseded in-flight fetch can't clobber the shared cache / active scope
     // (#1194). The overview fetch URL depends on the just-committed active
     // scope, so the commit happens here, before it.
-    const projectsResult = await _ctxFetchProjectsData({ targetScope: requestedTier });
+    // Overview is the only consumer of runtime coverage (the Project Scope
+    // Matrix), so it is the only fetch that opts into the expensive probe.
+    const projectsResult = await _ctxFetchProjectsData({
+      targetScope: requestedTier,
+      includeCoverage: true,
+    });
     if (seq !== _ctxOverviewSeq || requestedTier !== _ctxTargetScope) return;
     _ctxCommitProjects(projectsResult);
     // Pin the resolved effective scope alongside the tier so the overview
@@ -1140,57 +1150,55 @@ function _renderProjectsMatrix() {
     const rootPath = scope.root || '';
     const isMissing = !!scope.missing;
 
-    // 요약 counts
-    const c = scope.counts || {};
+    // Inventory summary. ``counts`` is ``null`` when the projects fetch did not
+    // opt into ``?include=counts`` (or the scope has no root) — render a muted
+    // dash for "not computed" instead of a misleading all-zero row.
+    const hasCounts = !!scope.counts && typeof scope.counts === 'object';
+    const c = hasCounts ? scope.counts : {};
     const skillsCount = c.skills || 0;
     const commandsCount = c.commands || 0;
     const agentsCount = c.agents || 0;
     const mcpCount = c['mcp-servers'] || 0;
-    const countsHtml = `<span class="ctx-matrix-counts" title="Skills: ${skillsCount}, Commands: ${commandsCount}, Agents: ${agentsCount}, MCP: ${mcpCount}">
+    const countsTitle = t('settings.ctx.matrix_counts_title', {
+      skills: skillsCount, commands: commandsCount, agents: agentsCount, mcp: mcpCount,
+    });
+    const countsHtml = hasCounts
+      ? `<span class="ctx-matrix-counts" title="${escapeHtml(countsTitle)}">
       🧩${skillsCount} ⌘${commandsCount} 🤖${agentsCount} 🔌${mcpCount}
-    </span>`;
+    </span>`
+      : '<span class="ctx-matrix-counts text-muted">—</span>';
 
-    // Runtimes columns
+    // Runtimes columns. State → (css class, label key, title key); labels and
+    // tooltips are localized via ``t()`` so the badges translate (the rest of
+    // the matrix already does). ``key`` also gates the registration suffix.
     const runtimeCols = runtimes.map(rtName => {
       const coverage = (scope.runtime_coverage || []).find(rc => rc.name === rtName);
-      if (!coverage) {
-        return `<td><span class="matrix-badge badge-gray">—</span></td>`;
-      }
-      
-      const available = !!coverage.available;
-      const installed = !!coverage.installed;
-      const registered = !!coverage.memtomem_registered;
-      
+      const available = !!(coverage && coverage.available);
+      const installed = !!(coverage && coverage.installed);
+      const registered = !!(coverage && coverage.memtomem_registered);
+
       let badgeCls = 'badge-gray';
-      let badgeText = '—';
-      let titleText = 'Not detected';
-      
+      let key = 'none';
       if (available && installed && registered) {
-        badgeCls = 'badge-success';
-        badgeText = 'Active';
-        titleText = 'Detected, Installed & Registered';
+        badgeCls = 'badge-success'; key = 'active';
       } else if (available && installed) {
-        badgeCls = 'badge-warning';
-        badgeText = 'Detected';
-        titleText = 'Marker folder exists & client installed, but not registered';
+        badgeCls = 'badge-warning'; key = 'detected';
       } else if (available) {
-        badgeCls = 'badge-yellow';
-        badgeText = 'Available';
-        titleText = 'Marker folder exists, but client not installed';
+        badgeCls = 'badge-yellow'; key = 'available';
       } else if (installed) {
-        badgeCls = 'badge-blue';
-        badgeText = 'Client';
-        titleText = 'Client installed, but no project marker found';
+        badgeCls = 'badge-blue'; key = 'client';
       } else if (registered) {
-        badgeCls = 'badge-gray';
-        badgeText = 'Registered';
-        titleText = 'Registered but client not installed & no project marker found';
+        badgeCls = 'badge-gray'; key = 'registered';
       }
-      
-      if (registered && badgeText !== 'Registered' && badgeText !== '—') {
-        badgeText += ' (Reg)';
+
+      let badgeText = t(`settings.ctx.matrix_badge_${key}`);
+      // Mark registration only on states that don't already imply it — ``active``
+      // and ``registered`` do, and ``none`` carries no runtime to annotate.
+      if (registered && key !== 'active' && key !== 'registered' && key !== 'none') {
+        badgeText += t('settings.ctx.matrix_badge_reg_suffix');
       }
-      
+      const titleText = t(`settings.ctx.matrix_badge_${key}_title`);
+
       return `<td>
         <span class="badge ${badgeCls}" title="${escapeHtml(titleText)}">${escapeHtml(badgeText)}</span>
       </td>`;
@@ -1204,7 +1212,9 @@ function _renderProjectsMatrix() {
 
     // Sync button (CWD-locked mutator 경계 유지를 위해, Project Local은 no fan-out 이므로 비활성화)
     const isProjectLocal = _ctxTargetScope === 'project_local';
-    const syncDisabled = (isProjectLocal || isMissing) ? ' disabled title="No fan-out for project_local or missing project"' : '';
+    const syncDisabled = (isProjectLocal || isMissing)
+      ? ` disabled title="${escapeHtml(t('settings.ctx.matrix_sync_disabled_title'))}"`
+      : '';
     const syncBtn = `<button type="button" class="btn-primary btn-xs ctx-matrix-sync-btn" data-scope-id="${escapeHtml(scope.scope_id)}"${syncDisabled}>${escapeHtml(t('settings.ctx.sync') || 'Sync')}</button>`;
 
     // Remove button (Server CWD는 삭제 불가능)
@@ -1375,6 +1385,23 @@ async function _ctxSyncProjectScope(scopeId, btn) {
   btnLoading(btn, true);
   showToast(t('settings.ctx.sync_started') || 'Syncing project...', 'info');
 
+  // Pin BOTH scope and tier once, up front, then pass them frozen to every
+  // phase. ``_ctxWithTargetScope`` otherwise re-reads the mutable
+  // ``_ctxTargetScope`` global and re-resolves the id against the live
+  // ``_ctxProjectsCache`` on every call, so a mid-run tier-filter flip OR a
+  // projects-cache refresh (marking the pinned scope missing) could send later
+  // phases to a different (project, tier) — violating the "one (project, tier)
+  // per invocation" invariant the canonical Sync All enforces (ADR-0016 §5 /
+  // ADR-0021 §C). ``scopeResolved`` emits the already-effective id verbatim
+  // (Server-CWD collapses to '').
+  const pinnedScopeId = _ctxEffectiveScopeId(scopeId);
+  const pinnedTier = _ctxTargetScope;
+  const pinnedScopeOpts = {
+    scopeId: pinnedScopeId,
+    scopeResolved: true,
+    targetScope: pinnedTier,
+  };
+
   const succeeded = [];
   let failed = null;
   let settingsSeverity = null;
@@ -1392,7 +1419,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
       let resp;
       try {
         resp = await fetch(
-          _ctxWithTargetScope(`/api/context/${typ}/sync`, { scopeId: scopeId }),
+          _ctxWithTargetScope(`/api/context/${typ}/sync`, pinnedScopeOpts),
           { method: 'POST', headers }
         );
       } catch (err) {
@@ -1413,7 +1440,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
       anyPhaseStarted = true;
       try {
         const settingsResp = await fetch(
-          _ctxWithTargetScope('/api/context/settings/sync', { scopeId: scopeId }),
+          _ctxWithTargetScope('/api/context/settings/sync', pinnedScopeOpts),
           { method: 'POST', headers }
         );
         if (!settingsResp.ok) {
