@@ -199,6 +199,7 @@ def _compute_detected_runtimes(project_root: Path) -> list[dict[str, object]]:
 
 
 
+
 def _error_payload(exc: BaseException, *, shape: str = "total") -> dict:
     """Build the per-surface error envelope.
 
@@ -350,3 +351,26 @@ async def context_overview(
         "last_synced_at": last_synced_at,
         **result,
     }
+
+
+@router.get("/context/runtimes")
+async def context_runtimes(
+    project_root: Path = Depends(resolve_scope_root),
+) -> dict:
+    """Read-only provider-client registration status (ADR-0021 §B).
+
+    Reports per-client install + ``memtomem``/``mms`` registration for the
+    in-scope provider clients (Claude, Antigravity, Codex, Kimi). This is the
+    client/provider axis — distinct from ``overview.detected_runtimes`` (the
+    artifact fan-out chip strip). Read-only; returns no raw config contents
+    (the registry's trust boundary returns only booleans, location kinds, and
+    ``$HOME``-collapsed paths).
+    """
+    from memtomem.context.runtime_registry import probe_all_runtimes
+
+    try:
+        runtimes = [s.to_dict() for s in probe_all_runtimes(project_root)]
+    except Exception:
+        logger.exception("probe_all_runtimes failed")
+        runtimes = []
+    return {"project_root": str(project_root), "runtimes": runtimes}
