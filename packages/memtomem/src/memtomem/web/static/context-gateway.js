@@ -1065,26 +1065,35 @@ function _renderProjectsMatrix() {
       
       const available = !!coverage.available;
       const installed = !!coverage.installed;
+      const registered = !!coverage.memtomem_registered;
       
       let badgeCls = 'badge-gray';
       let badgeText = '—';
-      let titleText = '';
+      let titleText = 'Not detected';
       
-      if (available && installed) {
+      if (available && installed && registered) {
         badgeCls = 'badge-success';
         badgeText = 'Active';
-        titleText = 'Detected & Registered';
-      } else if (available) {
+        titleText = 'Detected, Installed & Registered';
+      } else if (available && installed) {
         badgeCls = 'badge-warning';
         badgeText = 'Detected';
-        titleText = 'Marker folder exists, but client not registered';
+        titleText = 'Marker folder exists & client installed, but not registered';
+      } else if (available) {
+        badgeCls = 'badge-yellow';
+        badgeText = 'Available';
+        titleText = 'Marker folder exists, but client not installed';
       } else if (installed) {
         badgeCls = 'badge-blue';
         badgeText = 'Client';
-        titleText = 'Client registered, but no project marker found';
+        titleText = 'Client installed, but no project marker found';
+      } else if (registered) {
+        badgeCls = 'badge-gray';
+        badgeText = 'Registered';
+        titleText = 'Registered but client not installed & no project marker found';
       }
       
-      if (coverage.memtomem_registered) {
+      if (registered && badgeText !== 'Registered' && badgeText !== '—') {
         badgeText += ' (Reg)';
       }
       
@@ -1162,7 +1171,7 @@ function _ctxWireProjectsMatrix() {
   container.querySelectorAll('.ctx-matrix-sync-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       const scopeId = btn.dataset.scopeId;
-      if (scopeId) {
+      if (scopeId !== undefined) {
         _ctxSyncProjectScope(scopeId, btn);
       }
     });
@@ -1260,6 +1269,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
   let failed = null;
   let settingsSeverity = null;
   let settingsReason = '';
+  let anyPhaseStarted = false;
   try {
     const csrf = await ensureCsrfToken();
     const headers = csrf
@@ -1268,6 +1278,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
     
     const types = ['skills', 'commands', 'agents', 'mcp-servers'];
     for (const typ of types) {
+      anyPhaseStarted = true;
       let resp;
       try {
         resp = await fetch(
@@ -1289,6 +1300,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
     }
 
     if (!failed) {
+      anyPhaseStarted = true;
       try {
         const settingsResp = await fetch(
           _ctxWithTargetScope('/api/context/settings/sync', { scopeId: scopeId }),
@@ -1353,11 +1365,13 @@ async function _ctxSyncProjectScope(scopeId, btn) {
       );
     } else {
       showToast(t('settings.ctx.sync_success'));
-      loadCtxOverview();
     }
   } catch (err) {
     showToast(err.message, 'error');
   } finally {
+    if (anyPhaseStarted) {
+      loadCtxOverview();
+    }
     btnLoading(btn, false);
   }
 }
