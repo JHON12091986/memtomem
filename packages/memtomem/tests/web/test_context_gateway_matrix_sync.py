@@ -330,3 +330,84 @@ def test_matrix_sync_server_cwd_empty_scope_id(page, mm_web_url: str) -> None:
         page.wait_for_timeout(50)
     assert overview_state["n"] >= 2
 
+
+def test_matrix_write_blocked_in_user_tier(page, mm_web_url: str) -> None:
+    """Matrix buttons sync, add-project, and remove must carry write-blocked attributes when target tier is user."""
+    install_default_stubs(page)
+    
+    page.route("**/api/context/projects**", lambda r: r.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(_MATRIX_PROJECTS)
+    ))
+    _stub_overview_with_counter(page, [_HEALTHY_OVERVIEW])
+
+    page.goto(mm_web_url)
+    _open_context_gateway(page)
+
+    page.wait_for_selector(".ctx-projects-matrix-table", timeout=5_000)
+
+    # Initially, project_shared is active => data-write-blocked must not exist
+    sync_btn = page.locator('.ctx-matrix-sync-btn[data-scope-id="scope-123"]')
+    add_btn = page.locator('.ctx-matrix-add-project-btn')
+    # Server CWD is not removable, but scope-123 is removable (has remove btn)
+    remove_btn = page.locator('.ctx-matrix-remove-btn[data-scope-id="scope-123"]')
+    
+    assert sync_btn.get_attribute("data-write-blocked") is None
+    assert add_btn.get_attribute("data-write-blocked") is None
+    assert remove_btn.get_attribute("data-write-blocked") is None
+
+    # Swap tier filter to "user"
+    page.locator('.ctx-tier-filter button[data-scope="user"]').click()
+
+    # Now, all matrix write affordances must carry data-write-blocked="user"
+    assert sync_btn.get_attribute("data-write-blocked") == "user"
+    assert add_btn.get_attribute("data-write-blocked") == "user"
+    assert remove_btn.get_attribute("data-write-blocked") == "user"
+
+
+def test_matrix_add_project_reloads_overview_and_does_not_redirect(page, mm_web_url: str) -> None:
+    """Matrix Add Project button opens picker, adds project, reloads overview, and remains on overview section."""
+    install_default_stubs(page)
+
+    # First load
+    page.route("**/api/context/projects**", lambda r: r.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps(_MATRIX_PROJECTS)
+    ))
+    overview_state = _stub_overview_with_counter(page, [_HEALTHY_OVERVIEW, _HEALTHY_OVERVIEW])
+
+    # Intercept known-projects POST
+    page.route("**/api/context/known-projects", lambda r: r.fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({"scope_id": "scope-new", "root": "/fake/new/project"})
+    ))
+
+    page.goto(mm_web_url)
+    _open_context_gateway(page)
+    page.wait_for_selector(".ctx-projects-matrix-table", timeout=5_000)
+
+    # Mock PathPicker.open to resolve with a path immediately
+    page.evaluate("window.PathPicker = { open: (opts) => opts.onSelect('/fake/new/project') }")
+
+    # Locate and click matrix Add Project button
+    add_btn = page.locator('.ctx-matrix-add-project-btn')
+    assert add_btn.is_visible()
+    add_btn.click()
+
+    # Wait for success toast
+    page.wait_for_selector("#toast-container .toast.toast-success", timeout=4_000)
+
+    # Verify overview reloaded (calls count goes from 1 to 2)
+    deadline = time.monotonic() + 3.0
+    while overview_state["n"] < 2 and time.monotonic() < deadline:
+        page.wait_for_timeout(50)
+    assert overview_state["n"] >= 2
+
+    # Verify we are still on the overview section, NOT redirected to skills
+    assert page.locator('#settings-ctx-overview').evaluate("el => el.classList.contains('active')")
+    assert not page.locator('#settings-ctx-skills').evaluate("el => el.classList.contains('active')")
+
+

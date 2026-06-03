@@ -432,6 +432,7 @@ function _ctxWireTierControls() {
 const _CTX_WRITE_BUTTON_SELECTOR = (
   '.ctx-create-btn, .ctx-import-btn, .ctx-sync-btn, '
   + '.ctx-detail-edit-btn, .ctx-detail-delete-btn, '
+  + '.ctx-matrix-sync-btn, .ctx-matrix-add-project-btn, .ctx-matrix-remove-btn, '
   // The single-item runtime-only import route (#940 import_<type>)
   // also flows through ``_reject_non_shared_write``, so the per-detail
   // "Import this <type>" button minted by ``_ctxLoadRuntimeOnlyDetail``
@@ -1212,45 +1213,61 @@ function _ctxWireProjectsMatrix() {
   });
 
   // 4. Add Project
-  container.querySelector('.ctx-matrix-add-project-btn')?.addEventListener('click', () => {
-    // Add Project trigger
-    const addBtn = document.querySelector('.ctx-add-project-btn');
-    if (addBtn) {
-      addBtn.click();
-    } else {
-      // Fallback click on any other section's add-project button or trigger manually
-      const onSelect = async (root) => {
-        if (!root) return;
-        try {
-          const csrf = await ensureCsrfToken();
-          const headers = csrf
-            ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
-            : { 'Content-Type': 'application/json' };
-          const r = await fetch('/api/context/known-projects', {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ root }),
-          });
-          if (!r.ok) {
-            const err = await r.json().catch(() => ({}));
-            showToast(err.detail || t('toast.request_failed'), 'error');
-            return;
-          }
-          const data = await r.json();
-          showToast(t('settings.ctx.add_project_success'), 'success');
-          if (data.scope_id) {
-            _ctxActiveScopeId = data.scope_id;
-            try { localStorage.setItem(_CTX_ACTIVE_SCOPE_KEY, _ctxActiveScopeId); } catch {}
-          }
-          loadCtxOverview();
-        } catch (err) {
-          showToast(t('toast.request_failed', { error: err.message }), 'error');
+  container.querySelector('.ctx-matrix-add-project-btn')?.addEventListener('click', (ev) => {
+    const btn = ev.currentTarget;
+    const onSelect = async (root) => {
+      if (!root) return;
+      btnLoading(btn, true);
+      try {
+        const csrf = await ensureCsrfToken();
+        const headers = csrf
+          ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
+          : { 'Content-Type': 'application/json' };
+        const r = await fetch('/api/context/known-projects', {
+          method: 'POST',
+          headers,
+          body: JSON.stringify({ root }),
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          showToast(err.detail || t('toast.request_failed'), 'error');
+          return;
         }
-      };
-      if (window.PathPicker && typeof window.PathPicker.open === 'function') {
-        window.PathPicker.open({ purpose: 'project', onSelect });
+        const data = await r.json();
+        const warningKey = data.warning_code
+          ? `settings.ctx.add_project_warning_${data.warning_code}`
+          : null;
+        if (warningKey) {
+          const localized = t(warningKey);
+          const message = localized === warningKey
+            ? (data.warning || localized)
+            : localized;
+          showToast(message, 'warning');
+        } else if (data.warning) {
+          showToast(data.warning, 'warning');
+        } else {
+          showToast(t('settings.ctx.add_project_success'), 'success');
+        }
+        if (data.scope_id) {
+          _ctxActiveScopeId = data.scope_id;
+          try { localStorage.setItem(_CTX_ACTIVE_SCOPE_KEY, _ctxActiveScopeId); } catch {}
+        }
+        loadCtxOverview();
+      } catch (err) {
+        showToast(t('toast.request_failed', { error: err.message }), 'error');
+      } finally {
+        btnLoading(btn, false);
       }
+    };
+    if (window.PathPicker && typeof window.PathPicker.open === 'function') {
+      window.PathPicker.open({ purpose: 'project', onSelect });
+      return;
     }
+    const raw = window.prompt(t('settings.ctx.add_project_prompt'), '');
+    if (!raw) return;
+    const root = raw.trim();
+    if (!root) return;
+    onSelect(root);
   });
 }
 
