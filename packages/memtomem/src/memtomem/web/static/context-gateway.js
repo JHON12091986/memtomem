@@ -3163,6 +3163,23 @@ function _ctxRenderDeepLinkBanner(type, link, matchCount) {
   listEl.insertBefore(banner, anchor);
 }
 
+// #1287: a healthy projects payload always contains the server-cwd scope, so
+// an empty roster (or a thrown load) means the load failed — not that the
+// inventory is empty. The old "No project scopes" empty state described an
+// impossible state and read as data loss; render a load error with a Retry
+// instead. ``retry`` is the surface's own reload entry point — the artifact
+// lists pass ``loadCtxList(type)``, the Projects portal (context-portal.js,
+// loaded after this file) passes ``loadCtxProjects()``.
+function _ctxScopesLoadError(listEl, message, detail, retry) {
+  listEl.innerHTML = emptyState('', message, detail || '');
+  const retryBtn = document.createElement('button');
+  retryBtn.type = 'button';
+  retryBtn.className = 'btn-ghost ctx-scopes-retry';
+  retryBtn.textContent = t('settings.ctx.retry');
+  retryBtn.addEventListener('click', () => { retry(); });
+  (listEl.querySelector('.empty-state') || listEl).appendChild(retryBtn);
+}
+
 async function loadCtxList(type) {
   const seq = ++_ctxListSeq[type];
   const listEl = qs(`ctx-${type}-list`);
@@ -3200,9 +3217,9 @@ async function loadCtxList(type) {
     const data = _ctxCommitProjects(result);
     const scopes = data.scopes || [];
     if (!scopes.length) {
-      // Should never happen — server cwd always present — but render
-      // something instead of leaving the panel blank.
-      listEl.innerHTML = emptyState('', t('settings.ctx.no_project_scopes'), '');
+      // Should never happen — server cwd always present — so treat it as a
+      // failed load (with Retry), not an empty inventory (#1287).
+      _ctxScopesLoadError(listEl, t('settings.ctx.scopes_load_failed'), '', () => loadCtxList(type));
       return;
     }
 
@@ -3359,7 +3376,10 @@ async function loadCtxList(type) {
     }
   } catch (err) {
     if (seq !== _ctxListSeq[type]) return;
-    listEl.innerHTML = emptyState('', t('settings.ctx.load_failed', { type: _ctxTypeName(type) }), err.message);
+    _ctxScopesLoadError(
+      listEl, t('settings.ctx.load_failed', { type: _ctxTypeName(type) }), err.message,
+      () => loadCtxList(type),
+    );
   }
 }
 
