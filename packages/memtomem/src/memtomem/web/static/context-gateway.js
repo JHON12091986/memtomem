@@ -2449,6 +2449,9 @@ async function _ctxSyncProjectScope(scopeId, btn) {
 
   const succeeded = [];
   let failed = null;
+  // Every failed phase (this card fan-out no longer aborts on the first
+  // per-phase HTTP error — #1396), so the partial toast can name them all.
+  const failedPhases = [];
   let settingsSeverity = null;
   let settingsReason = '';
   let anyPhaseStarted = false;
@@ -2472,15 +2475,20 @@ async function _ctxSyncProjectScope(scopeId, btn) {
           { method: 'POST', headers }
         );
       } catch (err) {
-        failed = { phase: typ, reason: err.message };
+        if (!failed) failed = { phase: typ, reason: err.message };
+        failedPhases.push(typ);
         break;
       }
       if (!resp.ok) {
-        failed = {
-          phase: typ,
-          reason: await _ctxErrorMessageFromResponse(resp, `Sync ${typ} failed`),
-        };
-        break;
+        // Recoverable per-phase HTTP error (e.g. a project_shared privacy-block
+        // 422): the server is up and the other types have no issue, so keep
+        // going — mirror the backend ``/sync-all`` per-phase isolation (#1396).
+        // Only a transport failure (above) aborts the run. ``failed`` keeps the
+        // FIRST failure (drives the toast reason + gates the settings phase).
+        const reason = await _ctxErrorMessageFromResponse(resp, `Sync ${typ} failed`);
+        if (!failed) failed = { phase: typ, reason };
+        failedPhases.push(typ);
+        continue;
       }
       succeeded.push(typ);
       const body = await resp.json().catch(() => ({}));
@@ -2502,6 +2510,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
             phase: 'settings',
             reason: await _ctxErrorMessageFromResponse(settingsResp, 'Settings sync failed'),
           };
+          failedPhases.push('settings');
         } else {
           const settingsData = await settingsResp.json().catch(() => ({}));
           const settingsResults = settingsData.results || [];
@@ -2522,6 +2531,7 @@ async function _ctxSyncProjectScope(scopeId, btn) {
         }
       } catch (err) {
         failed = { phase: 'settings', reason: err.message };
+        failedPhases.push('settings');
       }
     }
 
@@ -2530,10 +2540,12 @@ async function _ctxSyncProjectScope(scopeId, btn) {
       if (succeeded.length === 0) {
         showToast(t('toast.sync_failed', { error: failed.reason }), 'error');
       } else {
+        // Name EVERY failed phase — the loop no longer aborts on the first
+        // per-phase HTTP error (#1396); ``failed.reason`` stays the first one.
         showToast(
           t('toast.sync_partial_failed', {
             succeeded: succeeded.map(phaseLabel).join(', '),
-            failed_phase: phaseLabel(failed.phase),
+            failed_phase: failedPhases.map(phaseLabel).join(', '),
             reason: failed.reason,
           }),
           'error'
@@ -3100,12 +3112,16 @@ document.getElementById('ctx-sync-all-btn')?.addEventListener('click', async () 
         break;
       }
       if (!resp.ok) {
-        failed = {
-          phase: typ,
-          reason: await _ctxErrorMessageFromResponse(resp, `Sync ${typ} failed`),
-        };
+        // A per-phase HTTP error (e.g. a project_shared privacy-block 422) is
+        // recoverable for the run: the other types must still sync, so mirror
+        // the backend ``/sync-all`` per-phase isolation — CONTINUE rather than
+        // abort the whole fan-out (only a transport failure, above, aborts). The
+        // FIRST failure drives the toast reason + gates settings; the failed
+        // list comes from ``phaseStates`` (#1396).
+        const reason = await _ctxErrorMessageFromResponse(resp, `Sync ${typ} failed`);
+        if (!failed) failed = { phase: typ, reason };
         setPhase(typ, 'failed');
-        break;
+        continue;
       }
       // Parse the body for the per-type result counts (generated/dropped/
       // skipped). Tolerates an empty/non-JSON body — a bare ``{}`` yields all
@@ -3163,13 +3179,22 @@ document.getElementById('ctx-sync-all-btn')?.addEventListener('click', async () 
       setPhase('settings', 'syncing');
       let settingsResp;
       try {
+        // Inline the CSRF headers at the call site (rather than the shared
+        // run-level ``headers`` var): this phase's fetch sits beyond the
+        // invariant guard's binding-lookback window, so thread the token here.
+        // ``csrf`` is the run-level token bound above.
         settingsResp = await fetch(
           _ctxWithTargetScope('/api/context/settings/sync', {
             scopeId: syncAllScopeId,
             scopeResolved: true,
             targetScope: syncAllTier,
           }),
-          { method: 'POST', headers },
+          {
+            method: 'POST',
+            headers: csrf
+              ? { 'Content-Type': 'application/json', 'X-Memtomem-CSRF': csrf }
+              : { 'Content-Type': 'application/json' },
+          },
         );
       } catch (err) {
         failed = { phase: 'settings', reason: err.message };
@@ -3231,10 +3256,17 @@ document.getElementById('ctx-sync-all-btn')?.addEventListener('click', async () 
       if (succeeded.length === 0) {
         showToast(t('toast.sync_failed', { error: failed.reason }), 'error');
       } else {
+        // The loop no longer aborts on the first per-phase HTTP error (#1396),
+        // so name EVERY failed phase — derived from the authoritative per-phase
+        // status so the toast stays in lockstep with the summary rows. The
+        // reason stays the FIRST failure's (the summary carries the rest).
+        const failedPhaseLabels = _CTX_SYNC_PHASES
+          .filter((p) => phaseStates[p].state === 'failed')
+          .map(_ctxSyncPhaseLabel);
         showToast(
           t('toast.sync_partial_failed', {
             succeeded: succeeded.map(_ctxSyncPhaseLabel).join(', '),
-            failed_phase: _ctxSyncPhaseLabel(failed.phase),
+            failed_phase: failedPhaseLabels.join(', '),
             reason: failed.reason,
           }),
           'error',
