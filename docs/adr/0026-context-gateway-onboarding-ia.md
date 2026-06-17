@@ -309,7 +309,7 @@ drifted.
 | P0-4 confirm/glossary de-jargon — `move_copy_shared_confirm_message` rewritten (now "…into the project's shared store — committed to git…", no raw `canonical`/`project_shared`); scope-ID tooltips; nav glossary *defines* "canonical" | **Shipped** | #1356 (confirm rewrite); de-jargon companion PRs #1368 / #1375 (under issue #1352) |
 | **P1a — Simple-mode scaffold** — Simple/Advanced `localStorage` toggle, read-only, **Advanced default** (D-F staged opt-in) | **Shipped** | #1358 |
 | **P1b — Simple-mode inline actions** — per-type Sync/Import rows, cross-tier empty-state summary (D-D lean iii), 3-state Simple labels | **Shipped** | #1360 |
-| **P1 — Simple-as-default flip** (D-F) | **Deferred** — gated on the §Validation user test | — |
+| **P1 — Simple-as-default flip** (D-F) | **Staged** — the switch point (`context-gateway.js` `_CTX_SIMPLE_DEFAULT`) and the §Validation harness are in place; the live default **stays Advanced** (`_CTX_SIMPLE_DEFAULT = false`) until the §Validation user test clears probes 1–3. The flip itself = set the constant `true`, then a follow-up PR (deep-link scoping tighten + reference.md copy) flips this row to Shipped. Still gated on the user test. | staged (switch point + harness) |
 | **P2 — Bold** — Push/Pull verb rename, status collapse to ahead/behind/in-sync (D-B / D-C) | **Deferred** — gated on the §Validation user test | — |
 
 **§Validation status:**
@@ -363,6 +363,19 @@ parse-error item, "what's wrong, how fix?". **Pass bars:** P0 ships if
 probes 1–3 succeed for ≥4/6 without docs; P2 is gated on probe 5
 succeeding for ≥5/6 and the status-merge not costing power users the
 create-vs-overwrite distinction.
+
+### Reproducing the first-run state
+
+`seed_adr0026_validation_states`
+(`packages/memtomem/tests/fixtures/ctx_validation_states.py`) seeds the six
+probe affordances above into one project — out-of-sync, not-yet-imported, empty
+type, MCP orphan, MCP parse-error, and an in-sync baseline — so every
+participant sees the same Overview. `test_ctx_validation_harness.py` pins the
+seed against the real diff engine, including the easy-to-invert Store-vs-runtime
+direction (a runtime-only artifact reads as "Not yet imported", never "Out of
+sync"), so it cannot silently rot. It is version-controlled (not the gitignored
+`scripts/` tree) so it stays in lockstep with the moderated facilitator protocol
+that consumes it.
 
 ## Provisional decisions
 
