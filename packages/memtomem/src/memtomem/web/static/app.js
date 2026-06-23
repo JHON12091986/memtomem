@@ -2200,7 +2200,11 @@ function _renderChunkDist(distribution) {
 }
 
 // G. Namespace Summary
-function _formatHomeNsLabel(nsName) {
+// Shared friendly-label formatter for long namespace ids (Home chart, search
+// result badge, detail panel). Short ids (≤28 chars) pass through unchanged;
+// long auto-namespaces collapse to "provider: .../tail". The full id is always
+// preserved by callers in title/aria-label. Filter dropdowns keep full names.
+function formatNsLabel(nsName) {
   const raw = String(nsName || '');
   if (raw.length <= 28) return raw;
 
@@ -2252,7 +2256,7 @@ function _renderNsChart(namespaces) {
     const color = ns.color || palette[i % palette.length];
     const nsName = String(ns.namespace || '');
     const fullNs = escapeHtml(nsName);
-    const shortNs = escapeHtml(_formatHomeNsLabel(nsName));
+    const shortNs = escapeHtml(formatNsLabel(nsName));
     const nsAttr = escapeAttr(nsName);
     const actionLabel = escapeAttr(_homeNsActionLabel(nsName, ns.chunk_count));
     return `<div class="home-bar-row home-ns-row">
@@ -2730,6 +2734,26 @@ function _scoreViewForResult(r) {
   };
 }
 
+// Localized "Relevance" label, with an English fallback for the pre-i18n /
+// failed-locale path (mirrors the inline pattern used elsewhere on this surface).
+function _relevanceLabel() {
+  if (typeof t === 'function') {
+    const tr = t('search.relevance_label');
+    if (tr !== 'search.relevance_label') return tr;
+  }
+  return 'Relevance';
+}
+
+// First-time-friendly tooltip for the score bar; the raw retrieval math is
+// gated behind the Advanced-details reveal (see showDetail / style.css).
+function _relevanceTooltip() {
+  if (typeof t === 'function') {
+    const tr = t('search.relevance_tooltip');
+    if (tr !== 'search.relevance_tooltip') return tr;
+  }
+  return 'How closely this result matches your query.';
+}
+
 function _buildResultItem(r) {
   const list = qs('results-list');
   const item = document.createElement('div');
@@ -2764,7 +2788,7 @@ function _buildResultItem(r) {
   const ariaParts = [fname, lineRange, nsLabel, age].filter(Boolean);
   item.setAttribute('aria-label', ariaParts.join(', '));
   const nsBadge = r.chunk.namespace && r.chunk.namespace !== 'default'
-    ? ` <span class="badge badge-ns">${escapeHtml(r.chunk.namespace)}</span>` : '';
+    ? ` <span class="badge badge-ns" title="${escapeAttr(r.chunk.namespace)}">${escapeHtml(formatNsLabel(r.chunk.namespace))}</span>` : '';
   // ADR-0016 §7 canonical-residency tier badge. Default-omit for the
   // user tier so the common case stays visually quiet — only the
   // non-default tiers (project_shared / project_local) earn pixels.
@@ -2775,11 +2799,12 @@ function _buildResultItem(r) {
   const scoreView = _scoreViewForResult(r);
   const scorePct = scoreView.percent;
   const barColor = scorePct > 70 ? 'var(--green)' : scorePct > 40 ? 'var(--accent)' : 'var(--muted)';
-  let relevanceLabel = 'Relevance';
-  if (typeof t === 'function') {
-    const translated = t('search.relevance_label');
-    relevanceLabel = translated === 'search.relevance_label' ? relevanceLabel : translated;
-  }
+  const relevanceLabel = _relevanceLabel();
+  // The score badge is always visible and communicates relevance, so its hover
+  // title stays plain-language in every mode (no stale render-time state). The
+  // raw per-result retrieval score lives in the detail panel's #d-score, which
+  // the Advanced-details reveal un-hides. (aria-label is already friendly.)
+  const scoreTitle = _relevanceTooltip();
 
   const body = document.createElement('div');
   body.className = 'result-body';
@@ -2787,7 +2812,7 @@ function _buildResultItem(r) {
     <div class="result-item-row1">
       <span class="result-type-dot" style="background:${fileTypeColor(r.chunk.source_file || '')}"></span>
       <span class="result-filename">${escapeHtml(fname)}</span>
-      <span class="score-badge" title="${escapeAttr(scoreView.tooltip)}" aria-label="${escapeAttr(relevanceLabel)} ${escapeAttr(scoreView.label)}">${escapeHtml(relevanceLabel)} ${escapeHtml(scoreView.label)}</span>
+      <span class="score-badge" title="${escapeAttr(scoreTitle)}" aria-label="${escapeAttr(relevanceLabel)} ${escapeAttr(scoreView.label)}">${escapeHtml(relevanceLabel)} ${escapeHtml(scoreView.label)}</span>
       <span class="badge badge-retrieval badge-retrieval--${escapeAttr(r.source)} result-debug-meta">${escapeHtml(r.source)}</span>
       ${nsBadge}${tierBadge}${validityBadge}
     </div>
@@ -3039,6 +3064,19 @@ function renderResults(results, retrievalStats) {
   updateBulkToolbar(0);
   list.innerHTML = summaryHtml;
   list.classList.toggle('list-view', STATE.viewMode === 'list');
+  // "Advanced details" doubles as the retrieval-internals reveal: opening it
+  // sets body.show-retrieval-debug, surfacing the raw per-result source badge
+  // and the detail-panel score/source/RRF math (hidden by default). The
+  // <details> is rebuilt on every render, so restore + rebind each time.
+  const debugDetails = list.querySelector('.results-debug-details');
+  if (debugDetails) {
+    debugDetails.open = !!STATE.showRetrievalDebug;
+    debugDetails.addEventListener('toggle', () => {
+      STATE.showRetrievalDebug = debugDetails.open;
+      document.body.classList.toggle('show-retrieval-debug', debugDetails.open);
+    });
+  }
+  document.body.classList.toggle('show-retrieval-debug', !!STATE.showRetrievalDebug);
 
   if (STATE.groupMode) {
     const groups = {};
@@ -3096,14 +3134,20 @@ function showDetail(r) {
   qs('d-type').textContent = r.chunk.chunk_type.replace('_', ' ');
   const nsEl = qs('d-namespace');
   if (r.chunk.namespace && r.chunk.namespace !== 'default') {
-    nsEl.textContent = r.chunk.namespace;
+    // Friendly label; full id preserved in title + aria-label.
+    nsEl.textContent = formatNsLabel(r.chunk.namespace);
+    nsEl.title = r.chunk.namespace;
+    nsEl.setAttribute('aria-label', `namespace ${r.chunk.namespace}`);
     show(nsEl);
   } else {
+    nsEl.removeAttribute('title');
+    nsEl.removeAttribute('aria-label');
     hide(nsEl);
   }
   const srcEl = qs('d-source');
   srcEl.textContent = r.source;
-  srcEl.className = `badge badge-retrieval badge-retrieval--${r.source}`;
+  // Keep result-debug-meta so this raw retrieval-source badge stays gated.
+  srcEl.className = `badge badge-retrieval badge-retrieval--${r.source} result-debug-meta`;
 
   // Score detail row: rank + normalized display bar + raw diagnostic score.
   const rrfK = (STATE.serverConfig && STATE.serverConfig.search && STATE.serverConfig.search.rrf_k) || 60;
@@ -3115,7 +3159,11 @@ function showDetail(r) {
   qs('d-score-bar').style.width = `${pct.toFixed(1)}%`;
   qs('d-score-pct').textContent = `${pct.toFixed(0)}%`;
   const scoreDetailRow = qs('d-score-detail');
-  scoreDetailRow.dataset.tooltip = scoreView.isReranked
+  // Default hover tooltip is plain-language; the raw retrieval math lives in
+  // data-tooltip-debug and only renders under body.show-retrieval-debug
+  // (the Advanced-details reveal), so first-time users never meet RRF/k.
+  scoreDetailRow.dataset.tooltip = _relevanceTooltip();
+  scoreDetailRow.dataset.tooltipDebug = scoreView.isReranked
     ? `Reranker percentile ${pct.toFixed(0)}%; raw score ${r.score.toFixed(6)}`
     : `RRF ${r.score.toFixed(6)} / max ${maxRrf.toFixed(6)} (k=${rrfK}, ${nSources} sources)`;
   show(scoreDetailRow);
