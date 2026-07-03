@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mcp.server.fastmcp import Context
@@ -134,6 +135,31 @@ class AppContext:
     # Kept distinct from ``_config_lock`` so a long-running config write
     # cannot block a session start, and vice versa.
     _session_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Per-resolved-source-file locks that serialize the memory-file
+    # read → rewrite → re-index → rollback span in the MCP CRUD tools
+    # (``mem_edit`` / ``mem_delete`` / ``mem_add`` / ``mem_batch_add``).
+    # Without this, two concurrent tool calls on chunks in the same file
+    # each snapshot the same pre-image and stale line range, then clobber
+    # each other or splice over an unrelated entry (issue #1570).
+    #
+    # In-process ONLY, by design. This serializes concurrent CRUD within a
+    # single MCP server process/event loop — the issue's realistic vector
+    # (several agents sharing one server). Cross-process races (a second
+    # MCP server, the CLI, ``mm web``) and CRUD-vs-``memory-migrate`` are
+    # NOT covered here — the tool layer cannot hold the engine's sidecar
+    # ``_file_lock`` across the whole span without self-deadlocking on the
+    # nested acquisition inside ``index_file`` (see ``get_memory_file_lock``).
+    #
+    # A plain ``dict`` (not the ``web/routes/_locks.py`` per-loop proxy) is
+    # correct because an ``AppContext`` never outlives one event loop —
+    # ``from_components`` builds a fresh context per test/run, and
+    # ``asyncio.Lock`` binds its loop at first acquire on py312. Keys are
+    # canonicalized paths (``memory_file_lock_key``), bounded by the file
+    # count, so the dict is not evicted (pruning would race a waiter that
+    # already holds a ref).
+    _memory_file_locks: dict[str, asyncio.Lock] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     # ── current_namespace (validated) ─────────────────────────────────────
     # Property + setter pair so every write — whether via ``mem_ns_set``,
@@ -160,6 +186,46 @@ class AppContext:
         if value is not None:
             validate_namespace(value)
         self._current_namespace = value
+
+    @staticmethod
+    def memory_file_lock_key(path: Path) -> str:
+        """Canonical lock key for a memory file: resolved, then case-folded.
+
+        Case-folding is unconditional: on case-insensitive filesystems
+        (macOS APFS default, Windows NTFS) ``Notes.md`` and ``notes.md``
+        are the *same* file and must share one lock or the #1570
+        corruption recurs across the two spellings. On case-sensitive
+        filesystems the fold merely makes two genuinely distinct files
+        share a lock — needless serialization, never corruption.
+        """
+        return str(path.expanduser().resolve()).casefold()
+
+    def get_memory_file_lock(self, path: Path | str) -> asyncio.Lock:
+        """Return the per-file ``asyncio.Lock`` for ``path`` (issue #1570).
+
+        Callers hold this across a memory file's whole
+        read → rewrite → re-index → rollback span so concurrent MCP CRUD
+        tools cannot lose updates or splice over a stale line range.
+        ``path`` may be a ``Path`` (canonicalized here) or a ``str`` that
+        MUST already come from :meth:`memory_file_lock_key` — passing a raw
+        string path would silently key a second lock for the same file.
+        Get-or-create is race-free: a single event loop never suspends
+        between the ``dict`` read and write below.
+
+        Do NOT additionally hold the engine's sidecar ``_file_lock`` for
+        the same path across a span that calls ``index_file`` — that lock
+        is re-acquired inside ``index_file`` and ``portalocker`` contends
+        between file descriptors even in one process, so nesting it here
+        would self-deadlock. This in-process lock is the only serialization
+        the tool layer takes; cross-process safety is out of scope (see the
+        ``_memory_file_locks`` field comment).
+        """
+        key = path if isinstance(path, str) else self.memory_file_lock_key(path)
+        lock = self._memory_file_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._memory_file_locks[key] = lock
+        return lock
 
     # ── component accessors ───────────────────────────────────────────────
     # These raise ``RuntimeError`` if accessed before ``ensure_initialized``
