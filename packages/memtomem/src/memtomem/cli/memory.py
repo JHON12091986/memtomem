@@ -67,7 +67,16 @@ def _render_validity_window(valid_from_unix: int | None, valid_to_unix: int | No
     return f"[{_fmt(valid_from_unix)} → {_fmt(valid_to_unix)}]"
 
 
-@click.command()
+@click.command(
+    epilog="""
+Examples:
+
+  mm add "Redis LRU->LFU reduced cache misses by 40%" --tags "redis,performance"
+  mm add "Use connection pooling for database" --project "backend"
+  mm add "Fix memory leak in login flow" --tags "bug,fix" --project "auth"
+  mm add "Deployment checklist for v2.0" --scope project_shared --confirm-project-shared
+"""
+)
 @click.argument("content")
 @click.option("--title", "-t", default=None, help="Entry title")
 @click.option("--tags", default=None, help="Comma-separated tags")
@@ -301,7 +310,16 @@ async def _add(
             click.echo(f"Added to {target} ({stats.indexed_chunks} chunks indexed)")
 
 
-@click.command()
+@click.command(
+    epilog="""
+Examples:
+
+  mm recall --limit 10
+  mm recall --since 2026-06-01 --until 2026-07-01 --source-filter "deployment"
+  mm recall --namespace project --scope project_local --format json
+  mm recall --since 2026-Q2 --limit 5 --format plain
+"""
+)
 @click.option(
     "--since", default=None, help="Start date (YYYY, YYYY-MM, YYYY-MM-DD, or ISO datetime)"
 )
