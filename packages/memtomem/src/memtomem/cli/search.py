@@ -22,7 +22,16 @@ from memtomem.server.tools.search import (
 )
 
 
-@click.command()
+@click.command(
+    epilog="""
+Examples:
+
+  mm search "deployment checklist"
+  mm search "redis" --format json
+  mm search "memory" --tags "performance,redis" --limit 5
+  mm search "database" --scope "project_local,user" --top-k 15
+"""
+)
 @click.argument("query")
 @click.option("--top-k", "-k", default=10, help="Number of results")
 @click.option("--source-filter", "-s", default=None, help="Source file filter")
