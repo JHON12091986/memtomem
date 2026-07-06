@@ -362,7 +362,7 @@ Results are ranked by a combination of keyword relevance and semantic similarity
 
 ```
 "Remember that Redis LRU→LFU reduced cache misses by 40%"
-→  mem_add(content="Redis LRU→LFU migration reduced cache misses by 40%", tags="redis,performance")
+→  mem_add(content="Redis LRU→LFU migration reduced cache misses by 40%", tags=["redis", "performance"])
 ```
 
 ```bash
@@ -423,7 +423,7 @@ mm recall --since 2026-04  # recall by date
 mm config show             # view settings
 mm config set key value    # change a setting
 mm config unset key        # drop a pinned override (e.g., mmr.enabled)
-mm status                  # show indexing stats + config (terminal mirror of mem_status)
+mm status                  # show indexing stats + config (terminal mirror of mem_status; --json / --format json for scripts)
 mm embedding-reset         # check/resolve embedding model mismatch
 mm reset                   # delete all data and reinitialize the DB (--backup snapshots first)
 mm context detect          # find agent config files
