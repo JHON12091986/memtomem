@@ -10,6 +10,7 @@ Regression anchor for issue #248.
 from __future__ import annotations
 
 import json
+import warnings
 from pathlib import Path
 
 import pytest
@@ -103,6 +104,154 @@ def test_config_json_stale_removed_field_skipped_not_fatal(
     load_config_overrides(cfg)
     assert not hasattr(cfg.context_gateway, "user_tier_enabled")
     assert cfg.context_gateway.experimental_claude_projects_scan is True
+
+
+def test_config_json_cross_field_invariant_reverts_section(
+    override_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A config.json override violating a cross-field ``model_validator`` is
+    rejected, not silently accepted (issue #1681).
+
+    ``ConfigModel`` sub-configs don't set ``validate_assignment=True``, so the
+    ``@model_validator(mode="after")`` checks never re-run for the ``setattr``
+    override path — a keyless ``langfuse_enabled=true`` (which
+    ``SessionTraceConfig._require_keys_when_enabled`` rejects on direct
+    construction) used to slip through. ``load_config_overrides`` now
+    re-validates each assembled section and reverts to the pre-override
+    baseline on failure.
+    """
+    _clear_all_memtomem_env(monkeypatch)
+    # The keyless-langfuse validator has a documented exception for the
+    # Langfuse SDK's own env vars — strip them so the invariant actually fires.
+    monkeypatch.delenv("LANGFUSE_PUBLIC_KEY", raising=False)
+    monkeypatch.delenv("LANGFUSE_SECRET_KEY", raising=False)
+    override_path.write_text(
+        json.dumps({"session_trace": {"enabled": True, "langfuse_enabled": True}}),
+        encoding="utf-8",
+    )
+    cfg = Mem2MemConfig()
+    load_config_overrides(cfg)
+    # Section reverted to its known-good baseline (langfuse off), not accepted.
+    assert cfg.session_trace.langfuse_enabled is False
+
+
+def test_config_json_chunk_range_invariant_reverts_section(
+    override_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A cross-field range invariant (``min_chunk_tokens > max_chunk_tokens``)
+    in config.json reverts the indexing section rather than loading an
+    inconsistent config (issue #1681)."""
+    _clear_all_memtomem_env(monkeypatch)
+    default_min = Mem2MemConfig().indexing.min_chunk_tokens
+    default_max = Mem2MemConfig().indexing.max_chunk_tokens
+    override_path.write_text(
+        json.dumps({"indexing": {"min_chunk_tokens": 200, "max_chunk_tokens": 100}}),
+        encoding="utf-8",
+    )
+    cfg = Mem2MemConfig()
+    load_config_overrides(cfg, migrate=False)
+    assert cfg.indexing.min_chunk_tokens == default_min
+    assert cfg.indexing.max_chunk_tokens == default_max
+    assert cfg.indexing.min_chunk_tokens <= cfg.indexing.max_chunk_tokens
+
+
+def test_config_json_valid_override_still_applies(
+    override_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The re-validation guard must not reject valid overrides: a well-formed
+    section (and an unrelated sibling section) still load (issue #1681)."""
+    _clear_all_memtomem_env(monkeypatch)
+    override_path.write_text(
+        json.dumps(
+            {
+                "context_window": {"enabled": True},
+                "storage": {"sqlite_path": "/from/config.db"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    cfg = Mem2MemConfig()
+    load_config_overrides(cfg, migrate=False)
+    assert cfg.context_window.enabled is True
+    assert str(cfg.storage.sqlite_path) == "/from/config.db"
+
+
+def test_config_json_revalidation_does_not_re_emit_field_warnings(
+    override_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The section re-validation must not re-fire field-level deprecation
+    warnings for defaulted fields (issue #1681 review).
+
+    ``model_validate(model_dump())`` materializes defaults, which would
+    otherwise re-trigger e.g. the ``rerank.top_k`` migration warning for a
+    user who only set ``rerank.enabled`` — spurious, and fatal under
+    warnings-as-errors. A valid ``{"rerank": {"enabled": true}}`` must load
+    cleanly even when ``DeprecationWarning`` is escalated to an error.
+    """
+    _clear_all_memtomem_env(monkeypatch)
+    override_path.write_text(json.dumps({"rerank": {"enabled": True}}), encoding="utf-8")
+    cfg = Mem2MemConfig()
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", DeprecationWarning)
+        load_config_overrides(cfg, migrate=False)
+    assert cfg.rerank.enabled is True
+
+
+def test_config_json_legacy_field_deprecation_surfaced(
+    override_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A user-supplied legacy field's deprecation is surfaced (not swallowed)
+    without crashing under warnings-as-errors (issue #1681 review).
+
+    The re-validation captures the ``DeprecationWarning`` triggered by
+    ``rerank.top_k`` and re-emits it via the logger;
+    ``catch_warnings(record=True)`` keeps it from escalating to an exception
+    even under ``-W error``. The re-validation is a *check* — it does not
+    persist the coerced/migrated model back — so ``top_k`` is not auto-rewritten
+    into ``min_pool`` on the ``config.json`` path (that broader normalization is
+    out of scope); the surfaced warning tells the operator to migrate.
+    """
+    import logging
+
+    _clear_all_memtomem_env(monkeypatch)
+    override_path.write_text(json.dumps({"rerank": {"top_k": 50}}), encoding="utf-8")
+    cfg = Mem2MemConfig()
+    with warnings.catch_warnings(), caplog.at_level(logging.WARNING):
+        warnings.simplefilter("error", DeprecationWarning)
+        load_config_overrides(cfg, migrate=False)
+    # The deprecation is surfaced to the operator via logging, not swallowed.
+    assert any(
+        "DeprecationWarning" in rec.message and "top_k" in rec.message for rec in caplog.records
+    )
+    # The check does not mutate field types / apply the migration in place.
+    assert cfg.rerank.min_pool == Mem2MemConfig().rerank.min_pool
+
+
+def test_config_json_explicit_deprecated_field_at_default_still_surfaced(
+    override_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An explicitly-set deprecated key whose value equals the model default is
+    still surfaced (issue #1681 review, round 3).
+
+    The migrations are presence-keyed, so ``exclude_defaults`` alone would drop
+    a user's ``{"rerank": {"top_k": 20}}`` (20 == the ``top_k`` default) and
+    silently hide the deprecation. The applied-keys overlay forces it back into
+    the revalidation payload.
+    """
+    import logging
+
+    _clear_all_memtomem_env(monkeypatch)
+    override_path.write_text(json.dumps({"rerank": {"top_k": 20}}), encoding="utf-8")
+    cfg = Mem2MemConfig()
+    with caplog.at_level(logging.WARNING):
+        load_config_overrides(cfg, migrate=False)
+    assert any(
+        "DeprecationWarning" in rec.message and "top_k" in rec.message for rec in caplog.records
+    )
 
 
 def test_env_var_wins_over_config_json_scalar(
