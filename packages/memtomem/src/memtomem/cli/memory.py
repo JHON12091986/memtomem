@@ -371,6 +371,13 @@ async def _recall(
             project_context_root=project_context_root,
         )
 
+    if not chunks and fmt in ("table", "plain"):
+        click.secho(
+            "No results found. See `mm status` to confirm your index has chunks.",
+            fg="yellow",
+            err=True,
+        )
+
     if fmt == "json":
         out = [
             {
