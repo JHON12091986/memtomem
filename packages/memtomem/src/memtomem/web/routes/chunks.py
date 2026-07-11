@@ -85,7 +85,8 @@ async def edit_chunk(
             raise HTTPException(
                 status_code=503, detail="Memory file is locked by another writer; try again."
             )
-        assert fresh is not None
+        if fresh is None:
+            raise HTTPException(status_code=409, detail="Chunk state changed; retry.")
         meta = fresh.metadata
 
         # Re-check the symlink refusal on the FRESH source under the lock: a
@@ -192,7 +193,8 @@ async def delete_chunk(
             raise HTTPException(
                 status_code=503, detail="Memory file is locked by another writer; try again."
             )
-        assert fresh is not None
+        if fresh is None:
+            raise HTTPException(status_code=409, detail="Chunk state changed; retry.")
         meta = fresh.metadata
         source = meta.source_file
 

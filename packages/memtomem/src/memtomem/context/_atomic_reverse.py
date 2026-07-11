@@ -425,13 +425,15 @@ def diff_atomic_artifact(
                 continue
 
             item = canonical_index[name]
-            assert item is not None  # consumed by the parse-error branch above
+            if item is None:
+                raise RuntimeError(f"canonical parse state changed unexpectedly for {name!r}")
             # Cleanup item #2: the upstream ``runtime_fanout_root`` guard
             # above guarantees this runtime+scope has a fan-out root, so
             # ``gen.target_file`` cannot return ``None`` for any name.
             # Earlier defensive ``if target is None: continue`` removed.
             target = gen.target_file(project_root, name, scope=scope)
-            assert target is not None  # narrowed by upstream NO_FANOUT guard
+            if target is None:
+                raise RuntimeError(f"runtime fan-out target unavailable for {gen_name}:{name}")
 
             # A per-vendor override replaces the rendered runtime file at sync
             # time (``_sync_atomic`` Phase 2 / ADR-0008 Invariant 4) via

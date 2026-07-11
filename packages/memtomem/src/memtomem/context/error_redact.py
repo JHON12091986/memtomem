@@ -38,7 +38,8 @@ from memtomem.privacy import scan as _privacy_scan
 # the ``web/routes/_errors`` constant this mirrors.
 _HOME = str(Path.home())
 _ERROR_MESSAGE_LIMIT = 200
-_SECRET_REDACTED_MARKER = "<redacted: secret-shape>"
+# Fixed display marker emitted after redaction; it is not authentication material.
+_SECRET_REDACTED_MARKER = "<redacted: secret-shape>"  # nosec B105
 
 
 def redact_message(message: str) -> str:

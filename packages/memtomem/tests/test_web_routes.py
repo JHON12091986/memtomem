@@ -3580,16 +3580,12 @@ class TestUploadRedaction:
         self, client: AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         set_home(monkeypatch, tmp_path)
-        files = [
-            ("files", (f"{idx}.md", b"safe", "text/markdown")) for idx in range(33)
-        ]
+        files = [("files", (f"{idx}.md", b"safe", "text/markdown")) for idx in range(33)]
         resp = await client.post("/api/upload", files=files)
         assert resp.status_code == 413
         assert not (tmp_path / ".memtomem" / "uploads").exists()
 
-    async def test_request_content_length_cap_is_413_before_parsing(
-        self, client: AsyncClient
-    ):
+    async def test_request_content_length_cap_is_413_before_parsing(self, client: AsyncClient):
         resp = await client.post(
             "/api/upload",
             content=b"x",

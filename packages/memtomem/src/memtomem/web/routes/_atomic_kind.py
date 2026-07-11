@@ -653,7 +653,8 @@ async def diff_artifact(
             # rendered output — NOT the raw canonical text: some targets are
             # TOML/YAML, so a raw compare pinned this pane to a permanent
             # "out of sync" under an "in sync" list badge (#1247 id 30).
-            assert parsed is not None  # parse failures took the branch above
+            if parsed is None:
+                raise HTTPException(status_code=500, detail="Artifact parse state unavailable")
             artifact = parsed
             runtimes.append(
                 expected_vs_runtime_row(

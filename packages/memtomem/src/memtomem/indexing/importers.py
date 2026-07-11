@@ -135,10 +135,18 @@ async def import_notion(
     if export_path.suffix == ".zip":
         # Validate resource/traversal limits, then read markdown members
         # directly. No temporary plaintext extraction tree is created.
-        safe_extract_zip(export_path, Path("/tmp"), member_filter=lambda _: False)
         with zipfile.ZipFile(export_path, "r") as zf:
+            all_infos = zf.infolist()
+            if len(all_infos) > _ZIP_MAX_ENTRIES:
+                raise UnsafeArchiveError(
+                    f"archive has {len(all_infos)} entries (cap {_ZIP_MAX_ENTRIES})"
+                )
+            for info in all_infos:
+                member = Path(info.filename)
+                if member.is_absolute() or ".." in member.parts:
+                    raise UnsafeArchiveError(f"member {info.filename!r} escapes the archive root")
             infos = sorted(
-                (i for i in zf.infolist() if not i.is_dir() and i.filename.lower().endswith(".md")),
+                (i for i in all_infos if not i.is_dir() and i.filename.lower().endswith(".md")),
                 key=lambda i: i.filename,
             )
             total = sum(info.file_size for info in infos)

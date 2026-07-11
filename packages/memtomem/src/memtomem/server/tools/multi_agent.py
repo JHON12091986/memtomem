@@ -344,7 +344,8 @@ async def mem_agent_share(
             return key_err
         state, stored = await app.storage.idempotency_claim("mem_agent_share", idempotency_key)
         if state == "completed":
-            assert stored is not None  # completed rows always carry a result
+            if stored is None:
+                return "Error: completed idempotency record has no stored result."
             return stored + _REPLAY_MARKER
         if state == "pending":
             return _idempotency_in_progress_error(idempotency_key)
