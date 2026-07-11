@@ -17,6 +17,17 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+        exclude-patterns: ["pypa/gh-action-pypi-publish"]
+      pypi-publisher:
+        patterns: ["pypa/gh-action-pypi-publish"]
+
+  - package-ecosystem: "npm"
+    directory: "/packages/memtomem/tests-js"
+    schedule:
+      interval: "weekly"
+    groups:
+      js-tests:
+        patterns: ["*"]
 
   # uv workspace: the single root uv.lock holds everything (member runtime deps
   # are declared in packages/memtomem/pyproject.toml but resolved/locked here;

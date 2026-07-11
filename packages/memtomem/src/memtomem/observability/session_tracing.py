@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import random
 import re
 import time
@@ -531,7 +532,8 @@ def _write_local_jsonl(
         safe_metadata = _redact_metadata(metadata, payload_mode)
 
         jsonl_path = Path(jsonl_path_raw).expanduser().resolve()
-        jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        jsonl_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(jsonl_path.parent, 0o700)
 
         row: TraceRow = {
             "trace_id": trace_id,
@@ -547,7 +549,17 @@ def _write_local_jsonl(
             "metadata": safe_metadata,
             "payload": final_payload,
         }
-        with open(jsonl_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=str) + "\n")
+        flags = os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(jsonl_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                fd = -1
+                f.write(json.dumps(row, default=str) + "\n")
+        finally:
+            if fd >= 0:
+                os.close(fd)
     except Exception as e:
         logger.warning("Failed to write trace to JSONL path %s: %s", jsonl_path_raw, e)

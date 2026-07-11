@@ -14,6 +14,7 @@ from memtomem.server.context import CtxType, _get_app_initialized
 from memtomem.server.error_handler import tool_handler
 from memtomem.server.tool_registry import register
 from memtomem.server.helpers import _set_config_key
+from memtomem.secret_masking import is_secret_key, mask_secrets
 
 if TYPE_CHECKING:
     from memtomem.server.context import AppContext
@@ -437,13 +438,13 @@ async def mem_config(
             result += (
                 " (persisted to config.json)" if persist else " (runtime only — not persisted)"
             )
+        if is_secret_key(key.rsplit(".", 1)[-1]):
+            return f"Set {key} = '***'" + (
+                " (persisted to config.json)" if persist else " (runtime only — not persisted)"
+            )
         return result
 
-    config_dict = app.config.model_dump()
-    if config_dict.get("embedding", {}).get("api_key"):
-        config_dict["embedding"]["api_key"] = "***"
-    if config_dict.get("session_trace", {}).get("langfuse_secret_key"):
-        config_dict["session_trace"]["langfuse_secret_key"] = "***"
+    config_dict = mask_secrets(app.config.model_dump())
 
     if key:
         parts = key.split(".")

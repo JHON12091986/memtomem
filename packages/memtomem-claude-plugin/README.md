@@ -5,7 +5,7 @@ Claude Code plugin for the memtomem long-term memory MCP server
 
 One install bundles:
 
-- **MCP server** — launched on demand via `uvx --from memtomem memtomem-server`
+- **MCP server** — launched on demand from the plugin's exact reviewed core pin
   (requires [uv](https://docs.astral.sh/uv/) on PATH)
 - **Slash commands** — `/memtomem:setup`, `/memtomem:remember`,
   `/memtomem:search`, `/memtomem:recall`, `/memtomem:index`,

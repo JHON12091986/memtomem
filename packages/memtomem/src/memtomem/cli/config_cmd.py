@@ -12,6 +12,7 @@ from memtomem.config import (
     _EXTRA_MUTATION_FIELDS,
     coerce_and_validate,
 )
+from memtomem.secret_masking import is_secret_key, mask_secrets
 
 
 # ---------------------------------------------------------------------------
@@ -40,13 +41,7 @@ def config_show(fmt: str, *, as_json: bool = False) -> None:
     cfg = Mem2MemConfig()
     load_config_d(cfg)
     load_config_overrides(cfg)
-    data = cfg.model_dump()
-
-    # Mask sensitive fields
-    if data.get("embedding", {}).get("api_key"):
-        data["embedding"]["api_key"] = "***"
-    if data.get("session_trace", {}).get("langfuse_secret_key"):
-        data["session_trace"]["langfuse_secret_key"] = "***"
+    data = mask_secrets(cfg.model_dump())
 
     if fmt == "json":
         click.echo(json.dumps(data, indent=2, default=str))
@@ -107,7 +102,7 @@ def config_set(key: str, value: str) -> None:
 
     old_show = old_val
     new_show = coerced
-    if field_name == "langfuse_secret_key":
+    if is_secret_key(field_name):
         old_show = "***" if old_val else ""
         new_show = "***" if coerced else ""
     click.echo(f"{key}: {old_show} -> {new_show}")
