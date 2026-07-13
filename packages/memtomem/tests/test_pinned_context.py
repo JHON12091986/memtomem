@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -43,6 +44,15 @@ def test_agent_specific_block_shadows_general_even_from_lower_scope(pinned_store
     assert pinned_store.list(agent_id="worker")[0].content == "team general"
 
 
+def test_search_exclusion_roots_cover_every_scope_without_reading_files(pinned_store):
+    roots = pinned_store.search_exclusion_roots()
+    assert roots == (
+        pinned_store._base("user").resolve(),
+        pinned_store._base("project_shared").resolve(),
+        pinned_store._base("project_local").resolve(),
+    )
+
+
 def test_privacy_size_and_project_confirmation_gates(pinned_store):
     with pytest.raises(ValueError, match="exceeds"):
         pinned_store.set("large", "x" * 2001)
@@ -68,19 +78,62 @@ async def test_compose_pinned_first_then_retrieval(pinned_store):
     chunk = SimpleNamespace(
         id="chunk-1",
         content="retrieved memory",
-        metadata=SimpleNamespace(source_file="memory.md"),
+        metadata=SimpleNamespace(source_file="memory.md", namespace="work"),
     )
     result = SimpleNamespace(chunk=chunk, score=0.9)
 
     class Pipeline:
         async def search(self, **kwargs):
             assert kwargs["query"] == "deployment"
+            assert kwargs["namespace"] == ["work", "shared"]
+            assert kwargs["context_window"] == 2
+            assert kwargs["exclude_source_roots"] == pinned_store.search_exclusion_roots()
             return [result], None
 
-    bundle = await ContextAssembler(pinned_store, Pipeline()).compose("deployment")
+    bundle = await ContextAssembler(pinned_store, Pipeline()).compose(
+        "deployment", namespace=["work", "shared"], context_window=2
+    )
     assert bundle.pinned[0].content == "always visible"
     assert bundle.retrieved[0]["content"] == "retrieved memory"
+    assert bundle.retrieved[0]["namespace"] == "work"
     assert bundle.used_chars == len("always visible") + len("retrieved memory")
+
+
+@pytest.mark.asyncio
+async def test_mem_context_compose_tool_threads_schema_two_scope(monkeypatch, pinned_store):
+    from memtomem.server.tools import pinned as pinned_tools
+
+    pinned_store.set("profile", "always visible", priority=1)
+    chunk = SimpleNamespace(
+        id="chunk-1",
+        content="retrieved memory",
+        metadata=SimpleNamespace(source_file="memory.md", namespace="work"),
+    )
+    result = SimpleNamespace(chunk=chunk, score=0.9)
+
+    class Pipeline:
+        async def search(self, **kwargs):
+            assert kwargs["namespace"] == "work"
+            assert kwargs["context_window"] == 1
+            assert kwargs["exclude_source_roots"] == pinned_store.search_exclusion_roots()
+            return [result], None
+
+    app = SimpleNamespace(search_pipeline=Pipeline())
+
+    async def fake_store(ctx):
+        return app, pinned_store
+
+    monkeypatch.setattr(pinned_tools, "_store", fake_store)
+    payload = json.loads(
+        await pinned_tools.mem_context_compose(
+            query="deployment",
+            namespace="work",
+            context_window=1,
+        )
+    )
+
+    assert payload["pinned"][0]["content"] == "always visible"
+    assert payload["retrieved"][0]["namespace"] == "work"
 
 
 def test_delete_is_exact_and_confirmed_for_shared(pinned_store):
