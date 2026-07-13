@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import click
+
+from memtomem.formation import DEFAULT_STALE_CLAIM_MINUTES
 
 
 @click.group("review")
@@ -70,6 +72,44 @@ async def _show(candidate_id: str) -> None:
         click.echo(json.dumps(candidate, ensure_ascii=False, indent=2))
 
 
+@review.command("recover")
+@click.option(
+    "--stale-after-minutes",
+    type=click.IntRange(min=1, max=1440),
+    default=DEFAULT_STALE_CLAIM_MINUTES,
+    show_default=True,
+)
+@click.option("--limit", type=click.IntRange(min=1, max=1000), default=100)
+@click.option("--actor", default="cli-operator")
+def recover(stale_after_minutes: int, limit: int, actor: str) -> None:
+    """Return stale interrupted approval claims to the pending queue."""
+    asyncio.run(_recover(stale_after_minutes, limit, actor))
+
+
+async def _recover(stale_after_minutes: int, limit: int, actor: str) -> None:
+    from memtomem.cli._bootstrap import cli_components
+
+    if not actor.strip():
+        raise click.ClickException("Recovery actor cannot be empty")
+    stale_before = datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+    async with cli_components() as comp:
+        recovered = await comp.storage.recover_stale_memory_candidates(
+            stale_before=stale_before.isoformat(timespec="seconds"),
+            actor=actor,
+            limit=limit,
+        )
+        click.echo(
+            json.dumps(
+                {
+                    "ok": True,
+                    "recovered": len(recovered),
+                    "candidate_ids": recovered,
+                    "stale_before": stale_before.isoformat(timespec="seconds"),
+                }
+            )
+        )
+
+
 async def _decide(candidate_id: str, decision: str, reviewer: str, reason: str) -> None:
     from memtomem.cli._bootstrap import cli_components
     from memtomem.pinned import PinnedContextStore
@@ -91,15 +131,17 @@ async def _decide(candidate_id: str, decision: str, reviewer: str, reason: str) 
             claimed = await comp.storage.claim_memory_candidate(candidate_id, reviewer, reason)
             if claimed is None:
                 raise click.ClickException("Candidate state changed concurrently")
+            write_location = "the durable destination"
             try:
                 if candidate["destination"] == "pinned":
-                    PinnedContextStore(
+                    block = PinnedContextStore(
                         comp.config, project_root=_resolve_project_context_root(comp)
                     ).set(
                         f"candidate-{candidate_id[:8]}",
                         candidate["content"],
                         description=f"Approved {candidate['kind']} candidate",
                     )
+                    write_location = str(block.source_path)
                 else:
                     from memtomem.context._atomic import (
                         _CRUD_SIDECAR_LOCK_BUDGET_S,
@@ -109,6 +151,7 @@ async def _decide(candidate_id: str, decision: str, reviewer: str, reason: str) 
 
                     base = Path(comp.config.indexing.memory_dirs[0]).expanduser().resolve()
                     target = base / f"{datetime.now(timezone.utc):%Y-%m-%d}.md"
+                    write_location = str(target)
                     async with async_file_lock(
                         _lock_path_for(target), timeout=_CRUD_SIDECAR_LOCK_BUDGET_S
                     ):
@@ -129,7 +172,21 @@ async def _decide(candidate_id: str, decision: str, reviewer: str, reason: str) 
                 await comp.storage.release_memory_candidate(candidate_id)
                 raise
             if not await comp.storage.finalize_memory_candidate(candidate_id):
-                raise click.ClickException("Candidate claim was lost before finalization")
+                warning = (
+                    "Durable write completed, but the approval claim was recovered "
+                    "concurrently. The content already persists at "
+                    f"{write_location}; inspect it before taking further action and "
+                    "do not re-approve this candidate."
+                )
+                quarantined = await comp.storage.mark_memory_candidate_write_uncertain(
+                    candidate_id, actor="cli-finalizer", reason=warning
+                )
+                suffix = (
+                    " Candidate moved to write_uncertain."
+                    if quarantined
+                    else " Candidate state changed again; inspect the review queue."
+                )
+                raise click.ClickException(warning + suffix)
         else:
             changed = await comp.storage.decide_memory_candidate(
                 candidate_id, decision, reviewer, reason

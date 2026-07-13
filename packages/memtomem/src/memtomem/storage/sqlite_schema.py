@@ -585,12 +585,47 @@ def create_tables(
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             decided_at TEXT,
+            claim_started_at TEXT,
             UNIQUE(session_id, fingerprint)
         )
     """)
+    try:
+        db.execute("ALTER TABLE memory_candidates ADD COLUMN claim_started_at TEXT")
+    except sqlite3.OperationalError as e:
+        if "duplicate column" not in str(e).lower():
+            raise
+    # Existing ``writing`` rows predate claim timestamps. Stamp them at
+    # upgrade time rather than treating them as immediately stale: a still
+    # running old process gets the full recovery grace period, while a truly
+    # stranded row becomes recoverable after the documented threshold. This
+    # is idempotent because only NULL timestamps are touched.
+    db.execute(
+        "UPDATE memory_candidates SET claim_started_at=? "
+        "WHERE status='writing' AND claim_started_at IS NULL",
+        (datetime.now(timezone.utc).isoformat(timespec="seconds"),),
+    )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_memory_candidates_status "
         "ON memory_candidates(status, created_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_candidates_stale_claim "
+        "ON memory_candidates(status, claim_started_at)"
+    )
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS memory_candidate_transitions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_id TEXT NOT NULL REFERENCES memory_candidates(id) ON DELETE CASCADE,
+            from_status TEXT NOT NULL,
+            to_status TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+    """)
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_memory_candidate_transitions_candidate "
+        "ON memory_candidate_transitions(candidate_id, created_at)"
     )
 
     # --- Provenance-bearing temporal assertions (derived, rebuildable index) ---

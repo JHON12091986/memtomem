@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timedelta, timezone
 
-from memtomem.formation import scan_session_candidates
+from memtomem.formation import DEFAULT_STALE_CLAIM_MINUTES, scan_session_candidates
 from memtomem.pinned import PinnedContextStore
 from memtomem.server import mcp
 from memtomem.server.context import CtxType, _get_app_initialized
@@ -32,6 +33,39 @@ async def mem_candidate_list(status: str = "pending", limit: int = 100, ctx: Ctx
     return json.dumps(
         await app.storage.list_memory_candidates(status=status, limit=limit),
         ensure_ascii=False,
+    )
+
+
+@mcp.tool()
+@tool_handler
+@register("formation")
+async def mem_candidate_recover(
+    stale_after_minutes: int = DEFAULT_STALE_CLAIM_MINUTES,
+    limit: int = 100,
+    actor: str = "mcp-operator",
+    ctx: CtxType = None,
+) -> str:
+    """Return stale interrupted approval claims to the pending queue."""
+    if not 1 <= stale_after_minutes <= 1440:
+        return json.dumps({"ok": False, "reason": "stale_after_minutes must be between 1 and 1440"})
+    if not 1 <= limit <= 1000:
+        return json.dumps({"ok": False, "reason": "limit must be between 1 and 1000"})
+    if not actor.strip():
+        return json.dumps({"ok": False, "reason": "actor cannot be empty"})
+    app = await _get_app_initialized(ctx)
+    stale_before = datetime.now(timezone.utc) - timedelta(minutes=stale_after_minutes)
+    recovered = await app.storage.recover_stale_memory_candidates(
+        stale_before=stale_before.isoformat(timespec="seconds"),
+        actor=actor,
+        limit=limit,
+    )
+    return json.dumps(
+        {
+            "ok": True,
+            "recovered": len(recovered),
+            "candidate_ids": recovered,
+            "stale_before": stale_before.isoformat(timespec="seconds"),
+        }
     )
 
 
@@ -98,7 +132,26 @@ async def mem_candidate_review(
         await app.storage.release_memory_candidate(candidate_id)
         raise
     changed = await app.storage.finalize_memory_candidate(candidate_id)
+    if not changed:
+        warning = (
+            "Durable write completed, but the approval claim was recovered concurrently. "
+            "The write already persists; inspect the returned write details before taking "
+            "further action and do not re-approve this candidate."
+        )
+        quarantined = await app.storage.mark_memory_candidate_write_uncertain(
+            candidate_id, actor="mcp-finalizer", reason=warning
+        )
+        return json.dumps(
+            {
+                "ok": False,
+                "status": "write_uncertain" if quarantined else "state_changed",
+                "durable_write_persisted": True,
+                "reason": warning,
+                "write": write_result,
+            },
+            ensure_ascii=False,
+        )
     return json.dumps(
-        {"ok": changed, "status": "approved", "write": write_result},
+        {"ok": True, "status": "approved", "write": write_result},
         ensure_ascii=False,
     )
