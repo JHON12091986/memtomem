@@ -134,7 +134,9 @@ if (_ctxPortalInstallGuideModal) {
     // Code-fence header labels: "Terminal" flows through i18n
     // (guide_code_header_terminal). JSON / TOML stay literal as format names /
     // proper nouns — an explicit decision, not an oversight (#1351). The commands
-    // inside are copied verbatim from docs/guides/mcp-clients.md (the SoT).
+    // inside use the documented exact-pinned, no-install uvx form. This remains
+    // launchable when the web UI itself came from a project-local ``uv add``
+    // environment that external clients cannot discover on PATH.
     let guideHtml = '';
     if (runtimeName === 'claude') {
       guideHtml = `
@@ -144,7 +146,7 @@ if (_ctxPortalInstallGuideModal) {
             <span>${escapeHtml(t('settings.ctx.guide_code_header_terminal'))}</span>
             <button type="button" class="btn-ghost btn-xs copy-code-btn">${escapeHtml(t('settings.ctx.copy'))}</button>
           </div>
-          <pre class="guide-code"><code>claude mcp add memtomem -- uvx --from memtomem memtomem-server</code></pre>
+          <pre class="guide-code"><code>claude mcp add memtomem -- uvx --isolated --from 'memtomem[all]==0.3.10' memtomem-server</code></pre>
         </div>
         <p class="guide-note">${escapeHtml(t('settings.ctx.guide_claude_note'))}</p>
       `;
@@ -163,7 +165,7 @@ if (_ctxPortalInstallGuideModal) {
     "memtomem": {
       "type": "stdio",
       "command": "uvx",
-      "args": ["--from", "memtomem", "memtomem-server"]
+      "args": ["--isolated", "--from", "memtomem[all]==0.3.10", "memtomem-server"]
     }
   }
 }</code></pre>
@@ -179,7 +181,7 @@ if (_ctxPortalInstallGuideModal) {
           </div>
           <pre class="guide-code"><code>[mcp_servers.memtomem]
 command = "uvx"
-args = ["--from", "memtomem", "memtomem-server"]</code></pre>
+args = ["--isolated", "--from", "memtomem[all]==0.3.10", "memtomem-server"]</code></pre>
         </div>
       `;
     } else if (runtimeName === 'kimi') {
