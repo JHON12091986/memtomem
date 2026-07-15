@@ -1,4 +1,4 @@
-﻿from memtomem.llm.utils import strip_llm_response
+from memtomem.llm.utils import strip_llm_response
 
 
 def test_strip_llm_response_simple():
