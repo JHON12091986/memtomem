@@ -95,8 +95,67 @@ async def test_unknown_model_error_surfaces_supported_hint() -> None:
     assert "add_custom_model" in msg
 
 
-async def test_close_resets_model() -> None:
-    """close() must release the cached model so the reranker can be reused."""
+async def test_close_releases_model_and_refuses_reuse() -> None:
+    """close() releases the cached model AND further use raises (#1778) —
+    a closed instance must not silently re-download/re-init the model.
+    (Supersedes the pre-#1778 "can be reused" contract, which no caller
+    ever relied on.)"""
+    from pathlib import Path
+    from uuid import uuid4
+
+    from memtomem.config import RerankConfig
+    from memtomem.models import Chunk, ChunkMetadata, SearchResult
+    from memtomem.search.reranker.fastembed import FastEmbedReranker
+
+    reranker = FastEmbedReranker(
+        RerankConfig(
+            enabled=True,
+            provider="fastembed",
+            model="Xenova/ms-marco-MiniLM-L-6-v2",
+        )
+    )
+
+    class _FakeModel:
+        def rerank(self, query, documents):
+            return [0.5] * len(documents)
+
+    chunk = Chunk(
+        content="any content",
+        metadata=ChunkMetadata(source_file=Path("test.md")),
+        id=uuid4(),
+        embedding=[],
+    )
+    candidate = SearchResult(chunk=chunk, score=1.0, rank=1, source="fused")
+
+    # Positive control: the same instance reranks successfully pre-close.
+    reranker._model = _FakeModel()
+    reranked = await reranker.rerank("query", [candidate], top_k=5)
+    assert reranked[0].source == "reranked"
+
+    await reranker.close()
+    assert reranker._model is None
+
+    with pytest.raises(RuntimeError, match="closed"):
+        reranker._get_model()
+
+    # rerank() degrades through its own except-Exception fallback: the
+    # original candidates come back untouched, and no model reload happens.
+    fallback = await reranker.rerank("query", [candidate], top_k=5)
+    assert [r.chunk.id for r in fallback] == [candidate.chunk.id]
+    assert fallback[0].source == "fused"
+    assert reranker._model is None
+
+    await reranker.close()  # idempotent
+
+
+def test_close_landing_at_lock_acquisition_refuses_load() -> None:
+    """A loader thread can pass the outer _closed guard, then lose the race
+    to a concurrent close() before acquiring _load_lock; the re-check under
+    the lock must refuse the load (#1778 review). The interleaving is pinned
+    deterministically: a lock wrapper flips _closed at the exact acquisition
+    point instead of racing real threads."""
+    import threading
+
     from memtomem.config import RerankConfig
     from memtomem.search.reranker.fastembed import FastEmbedReranker
 
@@ -107,6 +166,73 @@ async def test_close_resets_model() -> None:
             model="Xenova/ms-marco-MiniLM-L-6-v2",
         )
     )
-    reranker._model = object()  # simulate loaded state
-    await reranker.close()
-    assert reranker._model is None
+
+    class _CloseOnAcquire:
+        def __init__(self) -> None:
+            self._inner = threading.Lock()
+
+        def __enter__(self):
+            reranker._closed = True  # the concurrent close() lands here
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc):
+            return self._inner.__exit__(*exc)
+
+    reranker._load_lock = _CloseOnAcquire()  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="closed"):
+        reranker._get_model()
+    assert reranker._model is None  # no model resurrected onto the closed instance
+
+
+async def test_close_during_construction_does_not_publish_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """close() landing while the model constructor is in flight (a
+    wall-clock-wide window — construction takes seconds) must not leave the
+    finished model published on the closed instance (#1780 codex review).
+    The real async close() runs mid-construction, gated by events."""
+    import asyncio
+    import threading
+
+    from memtomem.config import RerankConfig
+    from memtomem.search.reranker.fastembed import FastEmbedReranker
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _PausingModel:
+        def __init__(self, model_name: str, cache_dir: str) -> None:
+            entered.set()
+            assert release.wait(5)
+
+    monkeypatch.setattr("fastembed.rerank.cross_encoder.TextCrossEncoder", _PausingModel)
+
+    reranker = FastEmbedReranker(
+        RerankConfig(
+            enabled=True,
+            provider="fastembed",
+            model="Xenova/ms-marco-MiniLM-L-6-v2",
+        )
+    )
+
+    errors: list[BaseException] = []
+
+    def load() -> None:
+        try:
+            reranker._get_model()
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    loader = threading.Thread(target=load)
+    loader.start()
+    assert await asyncio.to_thread(entered.wait, 5)  # constructor is in flight
+
+    await reranker.close()  # lands mid-construction
+
+    release.set()
+    await asyncio.to_thread(loader.join, 5)
+    assert not loader.is_alive()
+
+    assert reranker._model is None  # the finished model was not published
+    assert errors and "closed" in str(errors[0])

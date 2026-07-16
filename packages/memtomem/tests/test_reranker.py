@@ -46,6 +46,27 @@ class TestCohereReranker:
         await reranker.close()
         assert reranker._client is None
 
+    @pytest.mark.asyncio
+    async def test_closed_instance_refuses_resurrect(self):
+        """#1778: post-close use must raise, not re-create the httpx client —
+        a client born after close() on a swapped-out instance leaks."""
+        from memtomem.config import RerankConfig
+        from memtomem.search.reranker.cohere import CohereReranker
+
+        config = RerankConfig(enabled=True, provider="cohere", api_key="test")
+        reranker = CohereReranker(config)
+        # Positive control: a live instance builds its client on demand.
+        assert reranker._get_client() is not None
+
+        await reranker.close()
+        assert reranker._client is None
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await reranker.rerank("query", [_make_result("a", 1.0)], top_k=5)
+        assert reranker._client is None  # no new client materialized
+
+        await reranker.close()  # idempotent
+
 
 class TestLocalReranker:
     def test_init(self):
@@ -77,6 +98,111 @@ class TestLocalReranker:
         reranker = LocalReranker(config)
         await reranker.close()
         assert reranker._model is None
+
+    @pytest.mark.asyncio
+    async def test_closed_instance_refuses_resurrect(self):
+        """#1778: post-close use must raise, not silently reload the model."""
+        from memtomem.config import RerankConfig
+        from memtomem.search.reranker.local import LocalReranker
+
+        config = RerankConfig(enabled=True, provider="local")
+        reranker = LocalReranker(config)
+        # Positive control: a live instance serves its cached model.
+        sentinel = object()
+        reranker._model = sentinel
+        assert reranker._get_model() is sentinel
+
+        await reranker.close()
+        assert reranker._model is None
+
+        with pytest.raises(RuntimeError, match="closed"):
+            await reranker.rerank("query", [_make_result("a", 1.0)], top_k=5)
+        assert reranker._model is None  # no reload
+
+        await reranker.close()  # idempotent
+
+    def test_close_landing_at_lock_acquisition_refuses_load(self):
+        """A loader thread can pass the outer _closed guard, then lose the
+        race to a concurrent close() before acquiring _load_lock; the
+        re-check under the lock must refuse the load (#1778 review).
+        Deterministic pin: a lock wrapper flips _closed at the acquisition
+        point instead of racing real threads."""
+        import threading
+
+        from memtomem.config import RerankConfig
+        from memtomem.search.reranker.local import LocalReranker
+
+        reranker = LocalReranker(RerankConfig(enabled=True, provider="local"))
+
+        class _CloseOnAcquire:
+            def __init__(self) -> None:
+                self._inner = threading.Lock()
+
+            def __enter__(self):
+                reranker._closed = True  # the concurrent close() lands here
+                return self._inner.__enter__()
+
+            def __exit__(self, *exc):
+                return self._inner.__exit__(*exc)
+
+        reranker._load_lock = _CloseOnAcquire()
+
+        with pytest.raises(RuntimeError, match="closed"):
+            reranker._get_model()
+        assert reranker._model is None
+
+    @pytest.mark.asyncio
+    async def test_close_during_construction_does_not_publish_model(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """close() landing while the model constructor is in flight must not
+        leave the finished model published on the closed instance (#1780
+        codex review). The real async close() runs mid-construction, gated
+        by events. sentence_transformers is not a test dependency, so a
+        pausing stand-in module is injected."""
+        import asyncio
+        import sys
+        import threading
+        import types
+
+        from memtomem.config import RerankConfig
+        from memtomem.search.reranker.local import LocalReranker
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        class _PausingModel:
+            def __init__(self, model_name: str) -> None:
+                entered.set()
+                assert release.wait(5)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "sentence_transformers",
+            types.SimpleNamespace(CrossEncoder=_PausingModel),
+        )
+
+        reranker = LocalReranker(RerankConfig(enabled=True, provider="local"))
+        errors: list[BaseException] = []
+
+        def load() -> None:
+            try:
+                reranker._get_model()
+            except RuntimeError as exc:
+                errors.append(exc)
+
+        loader = threading.Thread(target=load)
+        loader.start()
+        assert await asyncio.to_thread(entered.wait, 5)  # constructor in flight
+
+        await reranker.close()  # lands mid-construction
+
+        release.set()
+        await asyncio.to_thread(loader.join, 5)
+        assert not loader.is_alive()
+
+        assert reranker._model is None  # the finished model was not published
+        assert errors and "closed" in str(errors[0])
 
 
 class TestRerankerFactory:
